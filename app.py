@@ -1,17 +1,27 @@
 """
-CIVIC EVIDENCE STUDIO — functional Streamlit prototype (v2)
-===========================================================
+CIVIC EVIDENCE STUDIO — functional Streamlit prototype (v3, universal)
+======================================================================
 Information hierarchy:
 
   PROJECT
     └── ENGAGEMENT ACTIVITIES        (one activity can contain MANY files)
-          └── DATASETS / FILES
+          └── DATASETS / FILES       (distinguished by a generic DATASET DIMENSION)
                 └── RAW RECORDS
-                      → THEMES → EVIDENCE  (+ PROJECT CONSTRAINTS) → DECISION TRAILS
+                      → ANALYSES     (what the planner wants to learn)
+                          → AI-SUGGESTED PATTERNS → HUMAN THEMES → EVIDENCE
+                             (+ PROJECT CONSTRAINTS) → DECISION TRAILS
+
+The Insights Playground is not generated directly from uploaded files.
+An ANALYSIS defines: which datasets, what each dataset represents
+(comparison dimension), the analytical purpose, unit of analysis,
+questions to investigate, and which playground modules are enabled —
+configured from DATA CAPABILITIES (profiled from the actual data)
+plus ANALYSIS GOALS (confirmed by the user; AI only suggests).
 
 Provenance is preserved at every level: each processed record carries
-project_id, activity_id, dataset_id, source_file, scenario, topic,
+project_id, activity_id, dataset_id, source_file, dim_value, topic,
 record_id, response_id, the unaltered original comment, and reaction.
+Themes and evidence additionally carry the analysis that produced them.
 
 AI proposes; humans interpret, validate, and decide.
 """
@@ -137,6 +147,58 @@ DEFAULT_COMAP_ACTIVITY = {
     "notes": "",
 }
 
+# What distinguishes one dataset from another within an activity.
+# "Scenario" is only one possibility — never the assumed default.
+DIMENSION_TYPES = [
+    "Scenario", "Location / Neighborhood", "Stakeholder Group",
+    "Workshop / Session", "Date / Time Period", "Question / Topic",
+    "Engagement Round", "Other",
+    "None — files should simply be combined",
+]
+COMBINED_DIMENSION = "None — files should simply be combined"
+
+UNIT_TYPES = ["Comment", "Participant", "Vote", "Ranking", "Map Point",
+              "Interview Segment", "Workshop Contribution", "Idea", "Other"]
+
+# Analytical goals, each gated on a data capability (None = always available).
+GOAL_DEFS = [
+    ("Common themes", "text"),
+    ("Differences between groups / scenarios", "multi_group"),
+    ("Reasons for approval", "reaction"),
+    ("Reasons for disapproval", "reaction"),
+    ("Areas of agreement", "text"),
+    ("Areas of conflict", "reaction"),
+    ("Conditional support", "text"),
+    ("Priorities", "rankings"),
+    ("Trade-offs", "text"),
+    ("Spatial patterns", "coords"),
+    ("Demographic differences", "demographics"),
+    ("Changes over time", "dates"),
+    ("Outlier / minority perspectives", "text"),
+    ("Key quotes", "text"),
+]
+
+# Playground module registry: id -> (label, required capability, unavailable reason)
+MODULE_DEFS = {
+    "overview":  ("Overview", None,
+                  ""),
+    "comments":  ("Comments", "text",
+                  "No open-ended text fields exist in the selected datasets."),
+    "themes":    ("Themes", "text",
+                  "No open-ended text fields exist in the selected datasets."),
+    "compare":   ("Compare", "multi_group",
+                  "Only one dataset dimension value is available — "
+                  "nothing to compare."),
+    "map":       ("Map", "coords",
+                  "No geographic coordinates exist in the selected datasets."),
+    "timeline":  ("Timeline", "dates",
+                  "No date fields exist in the selected datasets."),
+    "rankings":  ("Rankings", "rankings",
+                  "No ranking variables exist in the selected datasets."),
+    "stakeholders": ("Stakeholders", "demographics",
+                     "No demographic fields exist in the selected datasets."),
+}
+
 
 def init_state():
     ss = st.session_state
@@ -147,6 +209,7 @@ def init_state():
             "engagement_activities": [
                 {"activity_id": "ENG-001",
                  "metadata": dict(DEFAULT_COMAP_ACTIVITY),
+                 "dimension": "Scenario",  # dataset dimension for this activity
                  "datasets": [],          # dataset dicts (see add_dataset)
                  "combined": None}        # processed activity dataframe
             ],
@@ -155,9 +218,11 @@ def init_state():
     ss.setdefault("dataset_seq", 0)
     ss.setdefault("constraints", [])          # PROJECT-level constraints
     ss.setdefault("constraint_seq", 0)
+    ss.setdefault("analyses", [])             # ANALYSIS objects (see Analysis Setup)
+    ss.setdefault("analysis_seq", 0)
+    ss.setdefault("active_analysis_id", None)
+    ss.setdefault("analysis_draft", None)     # in-progress Analysis Setup wizard
     ss.setdefault("clusters", {})             # cluster_key -> cluster dict
-    ss.setdefault("cluster_run_done", False)
-    ss.setdefault("cluster_scope_desc", "")
     ss.setdefault("tags", {})                 # record_id -> [{tag, origin}]
     ss.setdefault("themes", [])               # validated + human themes
     ss.setdefault("theme_seq", 0)
@@ -186,6 +251,40 @@ def get_activity(activity_id):
 
 def get_dataset(activity, dataset_id):
     return next((d for d in activity["datasets"] if d["dataset_id"] == dataset_id), None)
+
+
+def get_analysis(analysis_id):
+    return next((a for a in st.session_state.analyses
+                 if a["analysis_id"] == analysis_id), None)
+
+
+def active_analysis():
+    return get_analysis(st.session_state.active_analysis_id)
+
+
+def analysis_name(analysis_id):
+    a = get_analysis(analysis_id)
+    return a["analysis_name"] if a else (analysis_id or "—")
+
+
+def analysis_df(analysis):
+    """Records for one analysis: the activity's processed frame restricted to
+    the analysis's datasets, with dim_value set from the analysis's confirmed
+    dataset→value mapping (the comparison dimension)."""
+    activity = get_activity(analysis["activity_id"])
+    if activity is None or activity["combined"] is None:
+        return None
+    df = activity["combined"]
+    df = df[df["dataset_id"].isin(analysis["dataset_ids"])].copy()
+    if df.empty:
+        return None
+    mapping = analysis["comparison_dimension"].get("dataset_values", {})
+    if analysis["comparison_dimension"]["name"] == COMBINED_DIMENSION:
+        df["dim_value"] = "All records"
+    elif mapping:
+        df["dim_value"] = df["dataset_id"].map(
+            lambda d: mapping.get(d) or "(unspecified)")
+    return df
 
 
 def analysis_frames():
@@ -228,9 +327,30 @@ def _norm_reaction(v):
     return "none"
 
 
-def guess_scenario(filename):
+def guess_dim_value(filename):
+    """Guess this file's dimension value from its name (e.g. 'Scenario 2')."""
     m = re.search(r"scenario\s*_?\s*(\d)", filename, re.IGNORECASE)
-    return f"Scenario {m.group(1)}" if m else ""
+    if m:
+        return f"Scenario {m.group(1)}"
+    m = re.search(r"(?:round|session|phase|group)\s*_?\s*(\d)", filename,
+                  re.IGNORECASE)
+    if m:
+        return m.group(0).title()
+    return ""
+
+
+def guess_dimension_type(filenames):
+    """Guess the DATASET DIMENSION for a set of files (AI-suggested default)."""
+    names = " ".join(filenames).lower()
+    if "scenario" in names:
+        return "Scenario"
+    if any(w in names for w in ("round", "phase")):
+        return "Engagement Round"
+    if any(w in names for w in ("session", "workshop")):
+        return "Workshop / Session"
+    if any(w in names for w in ("neighborhood", "downtown", "district")):
+        return "Location / Neighborhood"
+    return "Other"
 
 
 def guess_topic(filename):
@@ -240,49 +360,186 @@ def guess_topic(filename):
     return ""
 
 
+# Column-name signals used by both standardization and profiling.
+_TEXT_COLS = ("comment", "comments", "commenttext", "text", "response",
+              "openended", "feedback", "answer")
+_REACTION_COLS = ("reaction", "reactions", "thumb", "thumbs", "sentiment")
+_ID_COLS = ("responseid", "respid", "responseld", "participantid", "userid")
+_LAT_COLS = ("lat", "latitude", "y", "ycoord")
+_LON_COLS = ("lon", "lng", "long", "longitude", "x", "xcoord")
+_DATE_COLS = ("date", "timestamp", "datetime", "created", "submitted")
+_RANK_HINTS = ("rank", "ranking", "priority")
+_VOTE_HINTS = ("vote", "votes", "choice", "selection")
+_DEMO_HINTS = ("age", "gender", "zip", "zipcode", "income", "ethnicity",
+               "race", "tenure", "residency", "stakeholder")
+
+
+def _norm_col(c):
+    return re.sub(r"[\s_]+", "", str(c).strip().lower())
+
+
+def profile_dataset(raw_df):
+    """Profile an uploaded file: columns, types, and detected capability fields.
+    Only reports what actually exists — capabilities are never fabricated."""
+    prof = {"n_rows": int(len(raw_df)), "columns": [],
+            "has_text": False, "has_reaction": False, "has_response_id": False,
+            "has_coords": False, "has_dates": False, "has_rankings": False,
+            "has_votes": False, "has_demographics": False}
+    lats, lons = False, False
+    for c in raw_df.columns:
+        nc = _norm_col(c)
+        s = raw_df[c]
+        missing = int(s.isna().sum())
+        if nc in _TEXT_COLS:
+            kind = "text"
+            prof["has_text"] = True
+        elif nc in _REACTION_COLS or nc == "vote":
+            kind = "reaction"
+            prof["has_reaction"] = True
+        elif nc in _ID_COLS or nc == "response":
+            kind = "id"
+            prof["has_response_id"] = True
+        elif nc in _LAT_COLS:
+            kind = "coordinate"
+            lats = True
+        elif nc in _LON_COLS:
+            kind = "coordinate"
+            lons = True
+        elif nc in _DATE_COLS or "date" in nc:
+            kind = "date"
+            prof["has_dates"] = True
+        elif any(h in nc for h in _RANK_HINTS):
+            kind = "ranking"
+            prof["has_rankings"] = True
+        elif any(h in nc for h in _VOTE_HINTS):
+            kind = "vote"
+            prof["has_votes"] = True
+        elif any(h in nc for h in _DEMO_HINTS):
+            kind = "demographic"
+            prof["has_demographics"] = True
+        elif pd.api.types.is_numeric_dtype(s):
+            kind = "numeric"
+        else:
+            nunique = s.nunique(dropna=True)
+            kind = "categorical" if nunique <= max(20, len(s) // 10) else "text"
+        prof["columns"].append({"name": str(c), "normalized": nc, "kind": kind,
+                                "dtype": str(s.dtype), "missing": missing})
+    prof["has_coords"] = lats and lons
+    return prof
+
+
+def data_capabilities(datasets):
+    """Aggregate DATA CAPABILITIES across selected datasets. Derived only from
+    profiled fields that actually exist."""
+    profs = [d.get("profile") for d in datasets if d.get("profile")]
+    caps = {
+        "text": any(p["has_text"] for p in profs),
+        "reaction": any(p["has_reaction"] for p in profs),
+        "response_id": any(p["has_response_id"] for p in profs),
+        "multi_group": len(datasets) > 1,
+        "coords": any(p["has_coords"] for p in profs),
+        "dates": any(p["has_dates"] for p in profs),
+        "rankings": any(p["has_rankings"] for p in profs),
+        "votes": any(p["has_votes"] for p in profs),
+        "demographics": any(p["has_demographics"] for p in profs),
+    }
+    return caps
+
+
+CAPABILITY_LABELS = [
+    ("text", "Open-ended comments"),
+    ("reaction", "Reaction variable"),
+    ("response_id", "Response / participant IDs"),
+    ("multi_group", "Multiple datasets available for comparison"),
+    ("coords", "Spatial coordinates"),
+    ("dates", "Date / time fields"),
+    ("rankings", "Ranking variables"),
+    ("votes", "Votes / selections"),
+    ("demographics", "Demographic fields"),
+]
+
+
+def capabilities_html(caps):
+    rows = []
+    for key, label in CAPABILITY_LABELS:
+        if caps.get(key):
+            rows.append(f'<span style="color:#3f6853;">✓</span> {label} detected')
+        else:
+            rows.append(f'<span style="color:#7c4f4e;">✕</span> {label} '
+                        'not available')
+    return ('<div class="ces-meta" style="line-height:1.9;">'
+            + "<br>".join(rows) + "</div>")
+
+
 def standardize_dataset(raw_df, dataset, activity):
     """Normalize an uploaded file into standard records with full provenance.
-    Returns (df, problems). Original comments are never altered."""
+    Returns (df, problems). Original comments are never altered.
+    Comment text is required; reaction and response ID are optional — when a
+    field is absent it is recorded as absent, never fabricated."""
     problems = []
     df = raw_df.copy()
-    df.columns = [re.sub(r"[\s_]+", "", str(c).strip().lower()) for c in df.columns]
+    df.columns = [_norm_col(c) for c in df.columns]
     colmap = {}
     for c in df.columns:
-        if c in ("comment", "comments", "commenttext", "text"):
+        if c in _TEXT_COLS and "comment" not in colmap.values():
             colmap[c] = "comment"
-        elif c in ("reaction", "reactions", "thumb", "thumbs", "vote"):
+        elif c in _REACTION_COLS or c == "vote":
             colmap[c] = "reaction"
-        elif c in ("responseid", "respid", "responseld", "response", "participantid"):
+        elif c in _ID_COLS or c == "response":
             colmap[c] = "response_id"
+        elif c in _LAT_COLS:
+            colmap[c] = "lat"
+        elif c in _LON_COLS:
+            colmap[c] = "lon"
+        elif c in _DATE_COLS:
+            colmap[c] = "record_date"
     df = df.rename(columns=colmap)
-    for req, label in [("comment", "Comment"), ("reaction", "Reaction"),
-                       ("response_id", "Response ID")]:
-        if req not in df.columns:
-            problems.append(
-                f"**{dataset['source_file']}** is missing a required column: "
-                f"**{label}**. Columns found: {', '.join(df.columns)}. "
-                "The app will not fabricate this field.")
-    if problems:
+    if "comment" not in df.columns:
+        problems.append(
+            f"**{dataset['source_file']}** has no open-ended text column "
+            f"(looked for: {', '.join(_TEXT_COLS[:4])}…). Columns found: "
+            f"{', '.join(df.columns)}. The app will not fabricate this field.")
         return None, problems
 
     df["comment"] = df["comment"].astype(str)
-    df["response_id"] = df["response_id"].astype(str).str.strip()
-    df["reaction_original"] = df["reaction"]
-    df["reaction"] = df["reaction"].apply(_norm_reaction)
+    if "response_id" in df.columns:
+        df["response_id"] = df["response_id"].astype(str).str.strip()
+        has_response = True
+    else:
+        has_response = False
+    if "reaction" in df.columns:
+        df["reaction_original"] = df["reaction"]
+        df["reaction"] = df["reaction"].apply(_norm_reaction)
+    else:
+        df["reaction_original"] = ""
+        df["reaction"] = "none"
     df = df.reset_index(drop=True)
 
     num = dataset["dataset_id"].split("-")[-1]
     df["record_id"] = [f"D{num}-{i + 1:05d}" for i in range(len(df))]
+    if not has_response:
+        # No participant ID exists — each record stands alone. Recorded, not
+        # fabricated: unique-participant counts will equal record counts.
+        df["response_id"] = df["record_id"]
+        problems = []  # not an error, but surface a note on the dataset
+        dataset["notes_auto"] = ("No response/participant ID column found — "
+                                 "unique participant counts fall back to "
+                                 "record counts.")
     df["project_id"] = st.session_state.project["project_id"]
     df["activity_id"] = activity["activity_id"]
     df["dataset_id"] = dataset["dataset_id"]
     df["source_file"] = dataset["source_file"]
-    df["scenario"] = dataset["scenario"] or "(unspecified)"
+    df["dim_value"] = dataset["dim_value"] or "(unspecified)"
     df["topic"] = dataset["topic"] or ""
 
-    cols = ["project_id", "activity_id", "dataset_id", "source_file", "scenario",
+    cols = ["project_id", "activity_id", "dataset_id", "source_file", "dim_value",
             "topic", "record_id", "response_id", "comment", "reaction",
             "reaction_original"]
+    # Carry every other detected column through (coordinates, dates, rankings,
+    # demographics…) so capability-gated modules can use the real fields.
+    for extra in df.columns:
+        if extra not in cols:
+            cols.append(extra)
     return df[cols], []
 
 
@@ -325,10 +582,33 @@ def _extract_json(text):
         return None
 
 
-def llm_interpret_cluster(sample_comments, keywords, scope_label):
+def llm_json(prompt, max_tokens=600):
+    """One LLM call returning parsed JSON, or None (no key / error)."""
     provider, key = llm_provider()
     if provider is None:
         return None
+    try:
+        if provider == "anthropic":
+            import anthropic
+            client = anthropic.Anthropic(api_key=key)
+            msg = client.messages.create(
+                model="claude-sonnet-4-5", max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}])
+            text = msg.content[0].text
+        else:
+            from openai import OpenAI
+            client = OpenAI(api_key=key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini", max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}])
+            text = resp.choices[0].message.content
+        return _extract_json(text)
+    except Exception as e:
+        st.session_state.setdefault("llm_errors", []).append(str(e))
+        return None
+
+
+def llm_interpret_cluster(sample_comments, keywords, scope_label):
     numbered = "\n".join(f"{i+1}. {c[:400]}" for i, c in enumerate(sample_comments[:12]))
     prompt = (
         "You are helping a city planner label a cluster of public-engagement comments "
@@ -341,29 +621,155 @@ def llm_interpret_cluster(sample_comments, keywords, scope_label):
         '"tags": ["<tag1>", "<tag2>", "<tag3>"]}\n'
         "Keep the name short (2-4 words). Do not overstate consensus."
     )
-    try:
-        if provider == "anthropic":
-            import anthropic
-            client = anthropic.Anthropic(api_key=key)
-            msg = client.messages.create(
-                model="claude-sonnet-4-5", max_tokens=400,
-                messages=[{"role": "user", "content": prompt}])
-            text = msg.content[0].text
-        else:
-            from openai import OpenAI
-            client = OpenAI(api_key=key)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini", max_tokens=400,
-                messages=[{"role": "user", "content": prompt}])
-            text = resp.choices[0].message.content
-        data = _extract_json(text)
-        if data and data.get("name"):
-            return {"name": str(data.get("name", "")).strip(),
-                    "summary": str(data.get("summary", "")).strip(),
-                    "tags": [str(t).strip() for t in (data.get("tags") or [])][:5]}
-    except Exception as e:
-        st.session_state.setdefault("llm_errors", []).append(str(e))
+    data = llm_json(prompt, max_tokens=400)
+    if data and data.get("name"):
+        return {"name": str(data.get("name", "")).strip(),
+                "summary": str(data.get("summary", "")).strip(),
+                "tags": [str(t).strip() for t in (data.get("tags") or [])][:5]}
     return None
+
+
+# ----------------------------------------------------------------------------
+# ANALYSIS SETUP SUGGESTIONS (AI proposes; humans confirm)
+# ----------------------------------------------------------------------------
+
+def heuristic_analysis_suggestions(activity, datasets, caps):
+    """Deterministic fallback suggestions when no LLM is configured.
+    Derived only from metadata and profiled fields."""
+    md = activity["metadata"]
+    files = [d["source_file"] for d in datasets]
+    dim = activity.get("dimension") or guess_dimension_type(files)
+    values = {d["dataset_id"]: (d["dim_value"] or d["dataset_name"]
+                                or d["source_file"]) for d in datasets}
+    found = []
+    if caps["text"]:
+        found.append("written comments")
+    if caps["reaction"]:
+        found.append("approve / disapprove / none reactions")
+    if caps["response_id"]:
+        found.append("response IDs")
+    if caps["coords"]:
+        found.append("geographic coordinates")
+    if caps["dates"]:
+        found.append("date fields")
+    intro = (f"I found {len(datasets)} dataset"
+             f"{'s' if len(datasets) != 1 else ''} within "
+             f"{md['activity_name'] or 'this activity'}.")
+    if found:
+        intro += ("\n\nThey contain:\n"
+                  + "\n".join(f"- {f}" for f in found))
+    if len(datasets) > 1:
+        intro += (f"\n\nThe files appear to represent different "
+                  f"{dim.lower()}s. Would you like to compare them?")
+    purpose = md["purpose"].strip() or (
+        "Understand what participants expressed during "
+        f"{md['activity_name'] or 'this engagement activity'} and the reasons "
+        "behind their responses.")
+    goals = []
+    if caps["text"]:
+        goals.append("Common themes")
+        goals.append("Key quotes")
+        goals.append("Conditional support")
+    if caps["multi_group"]:
+        goals.append("Differences between groups / scenarios")
+    if caps["reaction"]:
+        goals += ["Reasons for approval", "Reasons for disapproval",
+                  "Areas of conflict"]
+    unit = "Comment" if caps["text"] else ("Vote" if caps["votes"] else "Other")
+    topic = (datasets[0]["topic"] or "the proposal") if datasets else "the proposal"
+    dl = dim.lower()
+    questions = []
+    if caps["reaction"]:
+        questions.append(f"What reasons drive opposition to {topic.lower()}?")
+        questions.append("How do reasons for approval differ from reasons "
+                         "for disapproval?")
+    if caps["text"]:
+        questions.append(f"Are there forms of {topic.lower()} that receive "
+                         "conditional support?")
+    if caps["multi_group"]:
+        questions.append(f"Which themes appear across all {dl}s?")
+        questions.append(f"Which concerns are specific to one {dl}?")
+    # suggest only constraints participants actually mention in the data —
+    # a mention is evidence about their understanding, not the constraint
+    # itself; the user confirms relevance.
+    texts = " ".join(d["df"]["comment"].str.lower().str.cat(sep=" ")
+                     for d in datasets if d.get("df") is not None)
+    con_names = [c["name"] for c in st.session_state.constraints
+                 if c["name"].strip() and c["name"].strip().lower() in texts]
+    return {"intro": intro, "dimension": dim, "dataset_values": values,
+            "purpose": purpose, "goals": goals, "unit": unit,
+            "questions": questions[:5], "constraints": con_names,
+            "source": "heuristic"}
+
+
+def ai_analysis_suggestions(activity, datasets, caps):
+    """AI-suggested Analysis Brief. LLM when configured, heuristics otherwise.
+    Suggestions only — every field is confirmed or edited by the user."""
+    base = heuristic_analysis_suggestions(activity, datasets, caps)
+    provider, _ = llm_provider()
+    if provider is None:
+        return base
+    md = activity["metadata"]
+    ds_desc = "\n".join(
+        f'- {d["source_file"]} (dataset {d["dataset_id"]}, '
+        f'{d["profile"]["n_rows"] if d.get("profile") else "?"} rows; columns: '
+        f'{", ".join(c["name"] for c in (d.get("profile") or {}).get("columns", []))})'
+        for d in datasets)
+    caps_desc = ", ".join(k for k, v in caps.items() if v)
+    cons_desc = "; ".join(f'{c["id"]} {c["name"]}'
+                          for c in st.session_state.constraints) or "none"
+    prompt = (
+        "You are helping a city planner set up an ANALYSIS of public-engagement "
+        "data. Inspect the context and suggest a draft Analysis Brief. The "
+        "planner will confirm or edit everything — make suggestions, do not "
+        "overstate.\n\n"
+        f"ENGAGEMENT ACTIVITY: {md['activity_name']} — method: "
+        f"{md['engagement_method']}; date: {md['activity_date']}; purpose: "
+        f"{md['purpose']}\n"
+        f"DATASETS:\n{ds_desc}\n"
+        f"DATA CAPABILITIES (detected from actual fields): {caps_desc}\n"
+        f"DIMENSION TYPES to choose from: {', '.join(DIMENSION_TYPES)}\n"
+        f"PROJECT CONSTRAINTS on file: {cons_desc}\n\n"
+        "Respond with ONLY a JSON object:\n"
+        '{"intro": "<2-4 sentence conversational summary of what you found '
+        'and whether comparison makes sense>", '
+        '"dimension": "<one of the dimension types — what distinguishes these '
+        'datasets from each other>", '
+        '"dataset_values": {"<dataset_id>": "<short dimension value>"}, '
+        '"purpose": "<1-2 sentence analysis purpose>", '
+        '"goals": ["<goal>", "..."], '
+        '"unit": "<primary unit of analysis, e.g. Comment>", '
+        '"questions": ["<question 1>", "..."], '
+        '"constraints": ["<constraint name possibly relevant>"]}\n'
+        "Suggest only goals supported by the detected capabilities. Suggest "
+        "3-5 questions. Do not suggest spatial analysis unless coordinates "
+        "exist.")
+    data = llm_json(prompt, max_tokens=900)
+    if not data:
+        return base
+    out = dict(base)
+    out["source"] = "llm"
+    for k in ("intro", "purpose", "unit", "dimension"):
+        if isinstance(data.get(k), str) and data[k].strip():
+            out[k] = data[k].strip()
+    if out["dimension"] not in DIMENSION_TYPES:
+        out["dimension"] = base["dimension"]
+    if isinstance(data.get("dataset_values"), dict):
+        for did, v in data["dataset_values"].items():
+            if did in out["dataset_values"] and str(v).strip():
+                out["dataset_values"][did] = str(v).strip()
+    valid_goals = {g for g, _ in GOAL_DEFS}
+    if isinstance(data.get("goals"), list):
+        goals = [str(g).strip() for g in data["goals"] if str(g).strip()]
+        goals = [g for g in goals if g in valid_goals] or base["goals"]
+        out["goals"] = goals
+    if isinstance(data.get("questions"), list) and data["questions"]:
+        out["questions"] = [str(q).strip() for q in data["questions"]][:5]
+    if isinstance(data.get("constraints"), list):
+        known = {c["name"] for c in st.session_state.constraints}
+        out["constraints"] = [str(c).strip() for c in data["constraints"]
+                              if str(c).strip() in known]
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -371,8 +777,9 @@ def llm_interpret_cluster(sample_comments, keywords, scope_label):
 # ----------------------------------------------------------------------------
 
 def cluster_one_group(sdf):
-    """Cluster comments for one group (usually one scenario). Calculated fields
-    only — AI interpretation attached separately."""
+    """Cluster comments for one group (one dimension value, e.g. one scenario
+    or one neighborhood). Calculated fields only — AI interpretation attached
+    separately."""
     sdf = sdf[sdf["comment"].str.strip().astype(bool)]
     sdf = sdf[~sdf["comment"].str.strip().str.lower().isin(["nan", "none", ""])]
     n = len(sdf)
@@ -413,7 +820,7 @@ def cluster_one_group(sdf):
         else:
             majority, minority = "disapprove", "approve"
         clusters.append({
-            "scenario": sub["scenario"].iloc[0],
+            "group": sub["dim_value"].iloc[0],
             "record_ids": sub["record_id"].tolist(),
             "dataset_ids": sorted(sub["dataset_id"].unique().tolist()),
             "activity_ids": sorted(sub["activity_id"].unique().tolist()),
@@ -428,23 +835,35 @@ def cluster_one_group(sdf):
     return clusters
 
 
-def run_thematic_analysis(scope_df, scope_desc):
-    """Cluster the scoped records, grouped by scenario; attach AI interpretation.
-    Dataset/activity provenance is preserved inside every cluster."""
+def analysis_clusters(analysis_id, statuses=("ai-suggested", "validated")):
+    """Clusters belonging to one analysis (each analysis keeps its own)."""
+    return {k: c for k, c in st.session_state.clusters.items()
+            if c.get("analysis_id") == analysis_id and c["status"] in statuses}
+
+
+def run_thematic_analysis(analysis, scope_df, scope_desc):
+    """Cluster the scoped records for ONE analysis, grouped by the analysis's
+    comparison dimension; attach AI interpretation. Dataset/activity provenance
+    is preserved inside every cluster; clusters carry their analysis of origin."""
     provider, _ = llm_provider()
-    st.session_state.clusters = {}
-    groups = sorted(scope_df["scenario"].unique())
-    for scen in groups:
-        sdf = scope_df[scope_df["scenario"] == scen]
+    aid = analysis["analysis_id"]
+    # replace only this analysis's previous clusters — other analyses keep theirs
+    st.session_state.clusters = {
+        k: c for k, c in st.session_state.clusters.items()
+        if c.get("analysis_id") != aid}
+    groups = sorted(scope_df["dim_value"].unique())
+    for grp in groups:
+        sdf = scope_df[scope_df["dim_value"] == grp]
         found = cluster_one_group(sdf)
         for j, cl in enumerate(found):
-            key = f"{re.sub(r'[^A-Za-z0-9]', '', scen)}-C{j + 1}"
+            key = f"{aid}-{re.sub(r'[^A-Za-z0-9]', '', grp)}-C{j + 1}"
             cl["key"] = key
+            cl["analysis_id"] = aid
             cl["status"] = "ai-suggested"
             cl["constraint_links"] = {}
             rep_comments = records_for(cl["rep_ids"])["comment"].tolist()
             ai = llm_interpret_cluster(rep_comments, cl["keywords"],
-                                       f"{scope_desc}, {scen}") if provider else None
+                                       f"{scope_desc}, {grp}") if provider else None
             if ai:
                 cl["ai"] = {**ai, "source": "llm"}
             else:
@@ -457,8 +876,8 @@ def run_thematic_analysis(scope_df, scope_desc):
                     "tags": [w.title() for w in cl["keywords"][:3]],
                     "source": "fallback"}
             st.session_state.clusters[key] = cl
-    st.session_state.cluster_run_done = True
-    st.session_state.cluster_scope_desc = scope_desc
+    analysis["cluster_run_done"] = True
+    analysis["cluster_scope_desc"] = scope_desc
 
 
 # ----------------------------------------------------------------------------
@@ -493,10 +912,12 @@ def get_theme(theme_id):
 
 
 def add_evidence(item):
-    """Create an evidence item. theme_id may be None → Unassigned Evidence."""
+    """Create an evidence item. theme_id may be None → Unassigned Evidence.
+    Evidence created inside a playground carries its analysis of origin."""
     item["evidence_id"] = next_id("evidence_seq", "EV-", width=4)
     item["created"] = datetime.date.today().isoformat()
     item.setdefault("theme_id", None)
+    item.setdefault("analysis_id", st.session_state.active_analysis_id)
     st.session_state.evidence.append(item)
     return item["evidence_id"]
 
@@ -504,12 +925,12 @@ def add_evidence(item):
 def provenance_from_records(record_ids):
     sub = records_for(record_ids)
     if sub.empty:
-        return {"activity_ids": [], "dataset_ids": [], "scenarios": [],
+        return {"activity_ids": [], "dataset_ids": [], "dim_values": [],
                 "source_files": [], "response_ids": []}
     return {
         "activity_ids": sorted(sub["activity_id"].unique().tolist()),
         "dataset_ids": sorted(sub["dataset_id"].unique().tolist()),
-        "scenarios": sorted(sub["scenario"].unique().tolist()),
+        "dim_values": sorted(sub["dim_value"].unique().tolist()),
         "source_files": sorted(sub["source_file"].unique().tolist()),
         "response_ids": sorted(sub["response_id"].unique().tolist()),
     }
@@ -530,7 +951,7 @@ def comment_card(row, key_prefix, show_actions=True):
             tag_html += pill(t["tag"], "ai" if t["origin"] == "ai" else "human")
         st.markdown(
             pills((row["reaction"].title(), row["reaction"]),
-                  (row["scenario"], "gray")) + tag_html
+                  (row["dim_value"], "gray")) + tag_html
             + f'<div class="ces-meta" style="margin-top:6px;">'
               f'{row["record_id"]} · Response {row["response_id"]} · '
               f'{row["source_file"]} · {activity_name(row["activity_id"])}</div>',
@@ -551,7 +972,7 @@ def comment_card(row, key_prefix, show_actions=True):
                     add_evidence({
                         "type": "Direct Comment",
                         "record_ids": [row["record_id"]],
-                        "scenario": row["scenario"],
+                        "dim_value": row["dim_value"],
                         "reaction": row["reaction"],
                         "original_comment": row["comment"],
                         "selected_quote": None,
@@ -592,7 +1013,7 @@ def comment_card(row, key_prefix, show_actions=True):
                         add_evidence({
                             "type": "Highlighted Quote",
                             "record_ids": [row["record_id"]],
-                            "scenario": row["scenario"],
+                            "dim_value": row["dim_value"],
                             "reaction": row["reaction"],
                             "original_comment": row["comment"],
                             "selected_quote": q.strip(),
@@ -619,13 +1040,16 @@ CONSTRAINT_TYPES = ["Legal / Regulatory", "Voter Mandate", "Financial", "Environ
 
 def render_dataset_row(activity, ds):
     """LEVEL 3 — one dataset/file inside an engagement activity."""
+    dim_label = activity.get("dimension") or "Distinguishing value"
+    if dim_label == COMBINED_DIMENSION:
+        dim_label = "Distinguishing value"
     n = len(ds["df"]) if ds["df"] is not None else 0
     label = f'{ds["dataset_name"] or ds["source_file"]} — {n} comments' \
             + ("" if ds["include"] else "  (excluded from analysis)")
     with st.expander(label):
         st.markdown(
             pills((ds["dataset_id"], "gray"),
-                  (ds["scenario"] or "no scenario", "gray"),
+                  (ds["dim_value"] or f"no {dim_label.lower()}", "gray"),
                   (ds["topic"] or "no topic", "gray"),
                   ("Included" if ds["include"] else "Excluded",
                    "validated" if ds["include"] else "review")),
@@ -634,13 +1058,17 @@ def render_dataset_row(activity, ds):
                     f'{n} comments · '
                     f'{ds["df"]["response_id"].nunique() if ds["df"] is not None else 0} '
                     f'unique response IDs</div>', unsafe_allow_html=True)
+        if ds.get("notes_auto"):
+            st.markdown(f'<div class="ces-note-yellow">{ds["notes_auto"]}</div>',
+                        unsafe_allow_html=True)
         with st.form(f"dsmeta-{ds['dataset_id']}"):
             c1, c2 = st.columns(2)
             with c1:
                 name = st.text_input("Dataset Name", ds["dataset_name"],
                                      placeholder="e.g. Housing — Scenario 1")
-                scenario = st.text_input("Scenario / Subgroup", ds["scenario"],
-                                         placeholder="e.g. Scenario 1")
+                dim_value = st.text_input(
+                    f"{dim_label} (what this file represents)", ds["dim_value"],
+                    placeholder="e.g. Scenario 1, Downtown, Session A")
             with c2:
                 topic = st.text_input("Topic / Category", ds["topic"],
                                       placeholder="e.g. Housing")
@@ -649,11 +1077,20 @@ def render_dataset_row(activity, ds):
                                 height=68)
             notes = st.text_area("Dataset Notes (optional)", ds["notes"], height=68)
             if st.form_submit_button("Save Dataset Metadata", type="primary"):
-                ds.update({"dataset_name": name.strip(), "scenario": scenario.strip(),
+                ds.update({"dataset_name": name.strip(), "dim_value": dim_value.strip(),
                            "topic": topic.strip(), "description": desc.strip(),
                            "notes": notes.strip(), "include": include})
                 activity["combined"] = None  # metadata changed → reprocess
                 st.rerun()
+        if ds.get("profile"):
+            with st.expander("Data profile (detected fields)"):
+                prof = ds["profile"]
+                st.dataframe(pd.DataFrame(prof["columns"])[
+                    ["name", "kind", "dtype", "missing"]],
+                    width="stretch", hide_index=True)
+                st.caption(f'{prof["n_rows"]} rows. Field kinds are detected '
+                           'from the actual data — capabilities are never '
+                           'fabricated.')
         if ds["df"] is not None:
             with st.expander("Preview data"):
                 st.dataframe(ds["df"].head(10), width="stretch",
@@ -694,12 +1131,19 @@ def render_activity_card(activity):
                 a_fac = st.text_input("Facilitator (optional)", md["facilitator"])
                 a_purpose = st.text_area("Activity Purpose", md["purpose"], height=68)
             a_notes = st.text_area("Notes (optional)", md["notes"], height=60)
+            cur_dim = activity.get("dimension") or "Other"
+            a_dim = st.selectbox(
+                "Dataset Dimension — what distinguishes one file from another "
+                "within this activity?", DIMENSION_TYPES,
+                index=DIMENSION_TYPES.index(cur_dim)
+                if cur_dim in DIMENSION_TYPES else DIMENSION_TYPES.index("Other"))
             if st.form_submit_button("Save Activity Metadata", type="primary"):
                 activity["metadata"] = {
                     "activity_name": a_name, "engagement_method": a_method,
                     "activity_date": a_date, "location": a_loc,
                     "stakeholder_groups": a_stake, "participant_count": a_count,
                     "facilitator": a_fac, "purpose": a_purpose, "notes": a_notes}
+                activity["dimension"] = a_dim
                 st.rerun()
 
         st.markdown("---")
@@ -708,8 +1152,9 @@ def render_activity_card(activity):
                     "dataset represents.")
 
         ups = st.file_uploader(
-            "Add file(s) to this activity (XLSX with columns: comment, reaction, "
-            "responseId)", type=["xlsx"], accept_multiple_files=True,
+            "Add file(s) to this activity (XLSX — an open-ended text column is "
+            "required; reaction, response ID, coordinates, and dates are "
+            "detected when present)", type=["xlsx"], accept_multiple_files=True,
             key=f"up-{activity['activity_id']}")
         known_files = {d["source_file"] for d in activity["datasets"]}
         added_new = False
@@ -719,14 +1164,15 @@ def render_activity_card(activity):
             ds_id = next_id("dataset_seq", "DATA-")
             ds = {"dataset_id": ds_id,
                   "dataset_name": (f'{guess_topic(up.name) or "Dataset"} — '
-                                   f'{guess_scenario(up.name)}').strip(" —"),
+                                   f'{guess_dim_value(up.name)}').strip(" —"),
                   "source_file": up.name,
-                  "scenario": guess_scenario(up.name),
+                  "dim_value": guess_dim_value(up.name),
                   "topic": guess_topic(up.name),
                   "description": "", "notes": "", "include": True,
-                  "df": None, "problems": []}
+                  "df": None, "problems": [], "profile": None}
             try:
                 raw_df = pd.read_excel(up)
+                ds["profile"] = profile_dataset(raw_df)
                 sdf, problems = standardize_dataset(raw_df, ds, activity)
                 ds["df"] = sdf
                 ds["problems"] = problems
@@ -752,7 +1198,7 @@ def render_activity_card(activity):
                 frames = []
                 for d in included:
                     f = d["df"].copy()
-                    f["scenario"] = d["scenario"] or "(unspecified)"
+                    f["dim_value"] = d["dim_value"] or "(unspecified)"
                     f["topic"] = d["topic"] or ""
                     f["source_file"] = d["source_file"]
                     frames.append(f)
@@ -770,13 +1216,20 @@ def render_activity_card(activity):
             m[2].metric("Datasets included", len(included))
             m[3].metric("Approve / Disapprove / None",
                         f'{cts["approve"]} / {cts["disapprove"]} / {cts["none"]}')
-            per = df.groupby(["dataset_id", "source_file", "scenario"]).agg(
+            per = df.groupby(["dataset_id", "source_file", "dim_value"]).agg(
                 comments=("record_id", "count"),
                 unique_respondents=("response_id", "nunique")).reset_index()
+            per = per.rename(columns={
+                "dim_value": activity.get("dimension") or "Value"})
             st.dataframe(per, width="stretch", hide_index=True)
+            st.markdown("**Data Capabilities** — detected from the actual "
+                        "fields in the included datasets:")
+            st.markdown(capabilities_html(data_capabilities(included)),
+                        unsafe_allow_html=True)
             st.caption("Every row retains project_id, activity_id, dataset_id, "
-                       "source_file, scenario, topic, record_id, and response_id — "
-                       "relationships are never flattened away.")
+                       "source_file, dimension value, topic, record_id, and "
+                       "response_id — relationships are never flattened away. "
+                       "Next step: define an Analysis in **02 Analysis Setup**.")
 
 
 def page_data_context():
@@ -822,6 +1275,7 @@ def page_data_context():
             all_activities().append({
                 "activity_id": f"ENG-{st.session_state.activity_seq:03d}",
                 "metadata": {k: "" for k in DEFAULT_COMAP_ACTIVITY},
+                "dimension": "Other",
                 "datasets": [], "combined": None})
             st.rerun()
 
@@ -884,10 +1338,379 @@ def page_data_context():
 
 
 # ----------------------------------------------------------------------------
-# PAGE 02 — INSIGHTS PLAYGROUND
+# PAGE 02 — ANALYSIS SETUP
 # ----------------------------------------------------------------------------
 
-def reaction_chart(df, group_col="scenario"):
+def module_availability(caps):
+    """Which playground modules the data can support, with reasons when not."""
+    available, unavailable = {}, {}
+    for mid, (label, req, reason) in MODULE_DEFS.items():
+        if req is None or caps.get(req):
+            available[mid] = label
+        else:
+            unavailable[mid] = (label, reason)
+    return available, unavailable
+
+
+def recommended_modules(caps, goals):
+    """Recommended module set from data capabilities + user goals."""
+    rec = ["overview"]
+    if caps.get("text"):
+        rec += ["comments", "themes"]
+    if caps.get("multi_group"):
+        rec.append("compare")
+    if caps.get("coords") and "Spatial patterns" in goals:
+        rec.append("map")
+    if caps.get("dates") and "Changes over time" in goals:
+        rec.append("timeline")
+    if caps.get("rankings") and "Priorities" in goals:
+        rec.append("rankings")
+    if caps.get("demographics") and "Demographic differences" in goals:
+        rec.append("stakeholders")
+    return rec
+
+
+def render_analysis_card(an):
+    """One saved analysis, with its brief and provenance."""
+    activity = get_activity(an["activity_id"])
+    dim = an["comparison_dimension"]
+    is_active = an["analysis_id"] == st.session_state.active_analysis_id
+    with st.container(border=True):
+        st.markdown(pills(
+            (an["analysis_id"], "gray"),
+            ("Active in Playground", "validated") if is_active
+            else ("Saved", "human"),
+            (dim["name"] if dim["name"] != COMBINED_DIMENSION
+             else "Combined datasets", "gray")), unsafe_allow_html=True)
+        st.markdown(f"### {an['analysis_name']}")
+        st.markdown(
+            f'<div class="ces-meta">'
+            f'<b>Activity:</b> {activity_name(an["activity_id"])} · '
+            f'<b>Datasets:</b> {", ".join(dim["values"]) or ", ".join(an["dataset_ids"])} · '
+            f'<b>Unit:</b> {an["unit_of_analysis"]}</div>',
+            unsafe_allow_html=True)
+        if an["purpose"]:
+            st.markdown(f'<div class="ces-note-human"><b>Purpose:</b> '
+                        f'{an["purpose"]}</div>', unsafe_allow_html=True)
+        if an["questions"]:
+            with st.expander(f"Questions to investigate ({len(an['questions'])})"):
+                for q in an["questions"]:
+                    st.markdown(f"- {q}")
+        mods = [MODULE_DEFS[m][0] for m in an["enabled_modules"]
+                if m in MODULE_DEFS]
+        st.markdown("Enabled modules: " +
+                    "".join(pill(m, "human") for m in mods),
+                    unsafe_allow_html=True)
+        n_themes = len([t for t in st.session_state.themes
+                        if t.get("analysis_id") == an["analysis_id"]])
+        n_ev = len([e for e in st.session_state.evidence
+                    if e.get("analysis_id") == an["analysis_id"]])
+        st.markdown(f'<div class="ces-meta">{n_themes} validated themes · '
+                    f'{n_ev} evidence items produced by this analysis</div>',
+                    unsafe_allow_html=True)
+        b1, b2, _ = st.columns([1.2, 1, 2.4])
+        if b1.button("Open in Playground", key=f"open-{an['analysis_id']}",
+                     type="primary"):
+            st.session_state.active_analysis_id = an["analysis_id"]
+            st.toast(f'“{an["analysis_name"]}” is now the active analysis — '
+                     'open 03 Insights Playground.')
+            st.rerun()
+        if b2.button("Delete", key=f"del-{an['analysis_id']}",
+                     disabled=(n_themes > 0 or n_ev > 0)):
+            st.session_state.analyses = [
+                a for a in st.session_state.analyses
+                if a["analysis_id"] != an["analysis_id"]]
+            if is_active:
+                st.session_state.active_analysis_id = None
+            st.rerun()
+        if n_themes or n_ev:
+            b2.caption("Has themes/evidence — cannot delete.")
+
+
+def render_analysis_wizard(draft):
+    """AI-assisted Analysis Brief: AI suggests, the human confirms everything."""
+    activity = get_activity(draft["activity_id"])
+    datasets = [get_dataset(activity, d) for d in draft["dataset_ids"]]
+    datasets = [d for d in datasets if d]
+    caps = draft["caps"]
+    sug = draft["sug"]
+    ai_pill = ("AI Suggested", "ai") if sug["source"] == "llm" \
+        else ("Suggested (rule-based — no AI key configured)", "review")
+
+    st.markdown("---")
+    st.subheader("Analysis Brief")
+    st.markdown(pills(ai_pill) + f'<span style="color:{C["text2"]};'
+                'font-size:13px;"> Everything below is a suggestion until you '
+                'confirm it. You can edit every field.</span>',
+                unsafe_allow_html=True)
+    st.markdown('<div class="ces-note-ai">' +
+                sug["intro"].replace("\n", "<br>") + "</div>",
+                unsafe_allow_html=True)
+    with st.expander("Data Capabilities (profiled from the selected datasets)"):
+        st.markdown(capabilities_html(caps), unsafe_allow_html=True)
+
+    a_name = st.text_input(
+        "Analysis Name", draft.get("name_default", ""),
+        placeholder="e.g. Housing Across Scenarios", key="wiz-name")
+
+    # ---- Q1: what does each dataset represent? ----
+    st.markdown("#### 1 · What does each dataset represent?")
+    dim_default = sug["dimension"] if sug["dimension"] in DIMENSION_TYPES else "Other"
+    dim = st.selectbox(
+        "Dataset Dimension", DIMENSION_TYPES,
+        index=DIMENSION_TYPES.index(dim_default), key="wiz-dim",
+        help="What distinguishes one dataset from another within this analysis.")
+    if dim == dim_default:
+        st.markdown(pills(("AI suggests: " + dim_default, "ai")),
+                    unsafe_allow_html=True)
+    ds_values = {}
+    if dim != COMBINED_DIMENSION:
+        for d in datasets:
+            ds_values[d["dataset_id"]] = st.text_input(
+                f'{d["source_file"]} →',
+                sug["dataset_values"].get(d["dataset_id"], ""),
+                key=f'wiz-dv-{d["dataset_id"]}')
+    else:
+        st.caption("The selected files will simply be combined — no "
+                   "comparison dimension.")
+
+    # ---- Q2: what was this engagement trying to learn? ----
+    st.markdown("#### 2 · What was this engagement activity trying to understand?")
+    purpose = st.text_area("Analysis Purpose", sug["purpose"], height=80,
+                           key="wiz-purpose")
+
+    # ---- Q3: what are you trying to learn now? ----
+    st.markdown("#### 3 · What would you like to understand from these datasets?")
+    goal_opts = [g for g, req in GOAL_DEFS if req is None or caps.get(req)]
+    hidden = [g for g, req in GOAL_DEFS if req is not None and not caps.get(req)]
+    goals = st.multiselect(
+        "Desired pattern types", goal_opts,
+        default=[g for g in sug["goals"] if g in goal_opts], key="wiz-goals")
+    if hidden:
+        st.caption("Not offered (unsupported by the available data): "
+                   + ", ".join(hidden))
+
+    # ---- Q4: primary unit of analysis ----
+    st.markdown("#### 4 · Primary unit of analysis")
+    unit_default = sug["unit"] if sug["unit"] in UNIT_TYPES else "Other"
+    unit = st.selectbox(
+        "What should the analysis primarily treat as the unit of input?",
+        UNIT_TYPES, index=UNIT_TYPES.index(unit_default), key="wiz-unit")
+    st.caption("Multiple rows can share one response ID — the app always "
+               "reports both comment counts and unique response-ID counts, "
+               "and never assumes one row equals one participant.")
+
+    # ---- Q5: what should be compared? ----
+    compare_values = []
+    if dim != COMBINED_DIMENSION and len(datasets) > 1:
+        st.markdown("#### 5 · What should be compared?")
+        vals = [v for v in ds_values.values() if v.strip()]
+        compare_values = st.multiselect(
+            f"Compare by {dim}", vals, default=vals, key="wiz-compare")
+    elif len(datasets) <= 1:
+        st.caption("Only one dataset selected — comparison is not applicable.")
+
+    # ---- Q6: questions to investigate ----
+    st.markdown("#### 6 · Questions to investigate")
+    st.markdown(pills(ai_pill) + f'<span style="color:{C["text2"]};'
+                'font-size:13px;"> Edit, delete, or add your own. These stay '
+                'visible in the Playground.</span>', unsafe_allow_html=True)
+    for q in list(draft["questions"]):
+        c1, c2 = st.columns([6, 1])
+        q["text"] = c1.text_input(
+            "Question", q["text"], key=f'wiz-q-{q["qid"]}',
+            label_visibility="collapsed")
+        if c2.button("✕", key=f'wiz-qdel-{q["qid"]}'):
+            draft["questions"] = [x for x in draft["questions"]
+                                  if x["qid"] != q["qid"]]
+            st.rerun()
+    if st.button("＋ Add Question"):
+        draft["qseq"] += 1
+        draft["questions"].append({"qid": draft["qseq"], "text": ""})
+        st.rerun()
+
+    # ---- Q7: relevant project constraints ----
+    st.markdown("#### 7 · Relevant project constraints")
+    cons = st.session_state.constraints
+    if not cons:
+        st.caption("No constraints documented yet — add them in "
+                   "01 Data + Context.")
+        confirmed_cons = []
+    else:
+        sug_cons = [c["id"] for c in cons if c["name"] in sug["constraints"]]
+        if sug_cons:
+            st.markdown(pills(("AI suggests as potentially relevant", "ai")) +
+                        " " + ", ".join(
+                            f'{cid} — '
+                            f'{next(c["name"] for c in cons if c["id"] == cid)}'
+                            for cid in sug_cons),
+                        unsafe_allow_html=True)
+        confirmed_cons = st.multiselect(
+            "Constraints you confirm as relevant to this analysis",
+            [c["id"] for c in cons], default=sug_cons,
+            format_func=lambda cid: f"{cid} — "
+            f"{next(c['name'] for c in cons if c['id'] == cid)}",
+            key="wiz-cons")
+    notes = st.text_area("Analysis Notes (optional)", "", height=60,
+                         key="wiz-notes")
+
+    # ---- recommended playground ----
+    st.markdown("---")
+    st.subheader("Recommended Playground")
+    st.caption("Generated from the available data + your analysis goals. "
+               "Toggle modules on or off.")
+    available, unavailable = module_availability(caps)
+    if dim == COMBINED_DIMENSION or len(compare_values) < 2:
+        if "compare" in available:
+            del available["compare"]
+            unavailable["compare"] = (
+                "Compare", "Fewer than two comparison values are selected.")
+    rec = recommended_modules(caps, goals)
+    enabled = []
+    mcols = st.columns(min(4, max(1, len(available))))
+    for i, (mid, label) in enumerate(available.items()):
+        with mcols[i % len(mcols)]:
+            if st.checkbox(label, value=(mid in rec), key=f"wiz-mod-{mid}"):
+                enabled.append(mid)
+    if unavailable:
+        st.markdown("**Unavailable**")
+        for mid, (label, reason) in unavailable.items():
+            st.markdown(f'<div class="ces-meta"><span style="color:#7c4f4e;">'
+                        f'✕</span> <b>{label}</b> — {reason}</div>',
+                        unsafe_allow_html=True)
+
+    # ---- generate ----
+    st.markdown("---")
+    g1, g2 = st.columns([1, 1])
+    if g1.button("GENERATE PLAYGROUND", type="primary", key="wiz-generate"):
+        if not a_name.strip():
+            st.error("The analysis needs a name.")
+            return
+        if dim != COMBINED_DIMENSION and not any(
+                v.strip() for v in ds_values.values()):
+            st.error(f"Provide at least one {dim} value, or choose "
+                     f"“{COMBINED_DIMENSION}”.")
+            return
+        questions = [q["text"].strip() for q in draft["questions"]
+                     if q["text"].strip()]
+        if dim == COMBINED_DIMENSION:
+            values = ["All records"]
+        else:
+            values = compare_values or [v for v in ds_values.values() if v.strip()]
+        analysis = {
+            "analysis_id": next_id("analysis_seq", "AN-"),
+            "analysis_name": a_name.strip(),
+            "activity_id": draft["activity_id"],
+            "dataset_ids": draft["dataset_ids"],
+            "comparison_dimension": {"name": dim, "values": values,
+                                     "dataset_values": {
+                                         k: v.strip() for k, v in
+                                         ds_values.items()}},
+            "purpose": purpose.strip(),
+            "unit_of_analysis": unit,
+            "questions": questions,
+            "desired_patterns": goals,
+            "enabled_modules": enabled or ["overview"],
+            "constraint_ids": confirmed_cons,
+            "ai_suggested_constraint_ids": [
+                c["id"] for c in cons
+                if c["name"] in sug["constraints"]] if cons else [],
+            "capabilities": caps,
+            "notes": notes.strip(),
+            "brief_source": sug["source"],
+            "created": datetime.date.today().isoformat(),
+            "cluster_run_done": False,
+            "cluster_scope_desc": "",
+        }
+        st.session_state.analyses.append(analysis)
+        st.session_state.active_analysis_id = analysis["analysis_id"]
+        st.session_state.analysis_draft = None
+        st.toast(f'Analysis {analysis["analysis_id"]} created — the Insights '
+                 'Playground is now configured for it.')
+        st.rerun()
+    if g2.button("Cancel", key="wiz-cancel"):
+        st.session_state.analysis_draft = None
+        st.rerun()
+
+
+def page_analysis_setup():
+    st.title("Analysis Setup")
+    st.markdown(f'<p style="color:{C["text2"]};margin-top:-8px;">Define what '
+                'you want to learn from your engagement data. An Analysis '
+                'connects selected datasets to your analytical goals and '
+                'configures the Insights Playground. AI helps configure — '
+                'you confirm everything.</p>', unsafe_allow_html=True)
+
+    processed = [a for a in all_activities() if a["combined"] is not None]
+    if not processed:
+        st.markdown('<div class="ces-note-human">No processed engagement data '
+                    'yet. Go to <b>01 Data + Context</b>, upload files into an '
+                    'engagement activity, and press <b>Process Activity '
+                    'Datasets</b>.</div>', unsafe_allow_html=True)
+        return
+
+    # ---------- existing analyses ----------
+    if st.session_state.analyses:
+        st.subheader("Analyses")
+        st.caption("The same dataset may be reused in multiple analyses — no "
+                   "re-uploading. Each analysis keeps its own playground, "
+                   "themes, and evidence.")
+        for an in st.session_state.analyses:
+            render_analysis_card(an)
+
+    # ---------- new analysis ----------
+    st.subheader("＋ New Analysis")
+    with st.container(border=True):
+        act_ids = [a["activity_id"] for a in processed]
+        sel_act = st.selectbox("Engagement Activity", act_ids,
+                               format_func=activity_name, key="new-an-act")
+        activity = get_activity(sel_act)
+        ds_opts = {d["dataset_id"]: (d["dataset_name"] or d["source_file"])
+                   for d in activity["datasets"]
+                   if d["include"] and d["df"] is not None}
+        sel_ds = st.multiselect("Datasets to analyze", list(ds_opts),
+                                default=list(ds_opts),
+                                format_func=lambda k: ds_opts[k],
+                                key="new-an-ds")
+        provider, _ = llm_provider()
+        st.caption("AI will inspect the engagement metadata, dataset "
+                   "metadata, field structure, and data capabilities, then "
+                   "suggest a draft Analysis Brief for you to confirm."
+                   if provider else
+                   "No AI key configured — rule-based suggestions will be "
+                   "used instead (everything remains editable).")
+        if st.button("Begin Analysis Setup", type="primary",
+                     disabled=(len(sel_ds) == 0), key="new-an-begin"):
+            datasets = [get_dataset(activity, d) for d in sel_ds]
+            caps = data_capabilities(datasets)
+            with st.spinner("Inspecting datasets and drafting the Analysis "
+                            "Brief…"):
+                sug = ai_analysis_suggestions(activity, datasets, caps)
+            topic = next((d["topic"] for d in datasets if d["topic"]), "")
+            dim_word = sug["dimension"].split(" /")[0]
+            name_default = (f"{topic} Across {dim_word}s".strip()
+                            if topic and len(datasets) > 1 else
+                            (activity["metadata"]["activity_name"]
+                             or "New Analysis"))
+            st.session_state.analysis_draft = {
+                "activity_id": sel_act, "dataset_ids": sel_ds,
+                "caps": caps, "sug": sug, "name_default": name_default,
+                "questions": [{"qid": i, "text": q}
+                              for i, q in enumerate(sug["questions"])],
+                "qseq": len(sug["questions"]),
+            }
+            st.rerun()
+
+    draft = st.session_state.analysis_draft
+    if draft:
+        render_analysis_wizard(draft)
+
+
+# ----------------------------------------------------------------------------
+# PAGE 03 — INSIGHTS PLAYGROUND (dynamically configured by the active ANALYSIS)
+# ----------------------------------------------------------------------------
+
+def reaction_chart(df, group_col="dim_value", group_label="Group"):
     groups = sorted(df[group_col].unique())
     fig = go.Figure()
     for reaction in ("approve", "disapprove", "none"):
@@ -902,17 +1725,17 @@ def reaction_chart(df, group_col="scenario"):
         font=dict(color=C["text"], size=13),
         legend=dict(orientation="h", y=1.12, title="Participant Reaction"),
         yaxis=dict(gridcolor=C["border"], zerolinecolor=C["border"]),
-        xaxis=dict(linecolor=C["border"]))
+        xaxis=dict(linecolor=C["border"], title=group_label))
     return fig
 
 
-def scenario_pct_table(df):
+def group_pct_table(df, dim_label="Group"):
     rows = []
-    for s in sorted(df["scenario"].unique()):
-        sdf = df[df["scenario"] == s]
+    for s in sorted(df["dim_value"].unique()):
+        sdf = df[df["dim_value"] == s]
         cts = reaction_counts(sdf)
         n = max(1, len(sdf))
-        rows.append({"Scenario": s, "Comments": len(sdf),
+        rows.append({dim_label: s, "Comments": len(sdf),
                      "Unique response IDs": sdf["response_id"].nunique(),
                      "Approve": f'{cts["approve"]} ({cts["approve"]/n:.0%})',
                      "Disapprove": f'{cts["disapprove"]} ({cts["disapprove"]/n:.0%})',
@@ -979,7 +1802,7 @@ def render_cluster_card(cluster):
         status_pill = []
         if cluster["status"] == "validated":
             status_pill = [("Human Validated", "validated")]
-        st.markdown(pills(src_pill, (cluster["scenario"], "gray"), *status_pill),
+        st.markdown(pills(src_pill, (cluster["group"], "gray"), *status_pill),
                     unsafe_allow_html=True)
         st.markdown(f"### {ai['name']}")
         st.markdown(
@@ -1013,13 +1836,14 @@ def render_cluster_card(cluster):
                     st.rerun()
             with b[2].popover("Merge"):
                 others = [k for k, c in st.session_state.clusters.items()
-                          if k != key and c["status"] == "ai-suggested"]
+                          if k != key and c["status"] == "ai-suggested"
+                          and c.get("analysis_id") == cluster.get("analysis_id")]
                 if others:
                     target = st.selectbox(
                         "Merge into", others,
                         format_func=lambda k:
                         f'{st.session_state.clusters[k]["ai"]["name"]} '
-                        f'({st.session_state.clusters[k]["scenario"]})',
+                        f'({st.session_state.clusters[k]["group"]})',
                         key=f"merge-sel-{key}")
                     if st.button("Merge clusters", key=f"merge-do-{key}"):
                         tgt = st.session_state.clusters[target]
@@ -1128,8 +1952,11 @@ def render_validation_form(cluster):
         prov = provenance_from_records(include)
         inc_sub = records_for(include)
         theme_id = next_id("theme_seq", "TH-")
+        an = get_analysis(cluster.get("analysis_id"))
         theme = {
             "theme_id": theme_id, "origin": "ai-validated",
+            "analysis_id": cluster.get("analysis_id"),
+            "dimension": (an["comparison_dimension"]["name"] if an else None),
             "ai_original_name": ai.get("original_name", ai["name"]),
             "ai_original_summary": ai["summary"], "ai_source": ai["source"],
             "name": name.strip(), "interpretation": interp.strip(),
@@ -1177,8 +2004,12 @@ def render_create_human_theme(df):
                     prov = provenance_from_records(include)
                     inc_sub = records_for(include)
                     theme_id = next_id("theme_seq", "TH-")
+                    an = active_analysis()
                     st.session_state.themes.append({
                         "theme_id": theme_id, "origin": "human",
+                        "analysis_id": an["analysis_id"] if an else None,
+                        "dimension": (an["comparison_dimension"]["name"]
+                                      if an else None),
                         "ai_original_name": None, "ai_original_summary": None,
                         "ai_source": None, "name": name.strip(),
                         "interpretation": interp.strip(),
@@ -1196,21 +2027,23 @@ def render_create_human_theme(df):
                     st.rerun()
 
 
-def cross_scenario_patterns():
-    clusters = [c for c in st.session_state.clusters.values()
-                if c["status"] in ("ai-suggested", "validated")]
-    by_scen = {}
+def cross_group_patterns(analysis):
+    """AI-computed pattern proposals from keyword overlap between one
+    analysis's clusters, across its comparison-dimension values."""
+    dim_word = analysis["comparison_dimension"]["name"].split(" /")[0]
+    clusters = list(analysis_clusters(analysis["analysis_id"]).values())
+    by_grp = {}
     for c in clusters:
-        by_scen.setdefault(c["scenario"], []).append(c)
-    scens = sorted(by_scen)
+        by_grp.setdefault(c["group"], []).append(c)
+    grps = sorted(by_grp)
     patterns, seen = [], set()
-    for i, s1 in enumerate(scens):
-        for c1 in by_scen[s1]:
+    for i, s1 in enumerate(grps):
+        for c1 in by_grp[s1]:
             group = [c1]
             kws1 = set(c1["keywords"])
-            for s2 in scens[i + 1:]:
+            for s2 in grps[i + 1:]:
                 best, best_j = None, 0.0
-                for c2 in by_scen[s2]:
+                for c2 in by_grp[s2]:
                     inter = len(kws1 & set(c2["keywords"]))
                     union = len(kws1 | set(c2["keywords"]))
                     j = inter / union if union else 0
@@ -1221,16 +2054,16 @@ def cross_scenario_patterns():
             gkey = tuple(sorted(c["key"] for c in group))
             if len(group) >= 2 and gkey not in seen:
                 seen.add(gkey)
-                n_scen = len({c["scenario"] for c in group})
-                if n_scen == len(scens) and len(scens) >= 3:
-                    rel = "Appears Across All Scenarios"
+                n_grp = len({c["group"] for c in group})
+                if n_grp == len(grps) and len(grps) >= 3:
+                    rel = f"Appears Across All {dim_word}s"
                 else:
-                    dis = {c["scenario"]: (c["counts"]["disapprove"] /
-                                           max(1, c["n_comments"])) for c in group}
+                    dis = {c["group"]: (c["counts"]["disapprove"] /
+                                        max(1, c["n_comments"])) for c in group}
                     strongest = max(dis, key=dis.get)
                     rel = (f"Stronger in {strongest}"
                            if max(dis.values()) - min(dis.values()) > 0.2
-                           else "Shared Across Scenarios")
+                           else f"Shared Across {dim_word}s")
                 patterns.append({"key": "|".join(gkey), "relationship": rel,
                                  "clusters": group,
                                  "shared_keywords": sorted(set.intersection(
@@ -1238,7 +2071,7 @@ def cross_scenario_patterns():
     for c in clusters:
         if not any(c in p["clusters"] for p in patterns):
             patterns.append({"key": c["key"],
-                             "relationship": "Mostly Scenario-Specific",
+                             "relationship": f"Mostly {dim_word}-Specific",
                              "clusters": [c],
                              "shared_keywords": c["keywords"][:4]})
     return patterns
@@ -1250,18 +2083,60 @@ def page_insights():
         pills(("AI-assisted analysis", "ai")) +
         f'<span style="color:{C["text2"]};font-size:13px;"> AI suggestions are '
         'starting points for human interpretation.</span>', unsafe_allow_html=True)
-    st.markdown(f'<p style="color:{C["text2"]};margin-top:-2px;">Explore the '
-                'records, compare datasets, and develop themes — within one dataset, '
-                'across selected datasets, or across the whole engagement '
-                'activity.</p>', unsafe_allow_html=True)
 
-    frames = analysis_frames()
-    if not frames:
-        st.markdown('<div class="ces-note-human">No processed activity dataset yet. '
-                    'Go to <b>01 Data + Context</b>, upload files into the '
-                    'engagement activity, and press <b>Process Activity '
-                    'Datasets</b>.</div>', unsafe_allow_html=True)
+    if not st.session_state.analyses:
+        st.markdown('<div class="ces-note-human">The Playground is generated '
+                    'from an <b>Analysis</b>, not directly from uploaded files. '
+                    'Go to <b>02 Analysis Setup</b>, define what you want to '
+                    'learn, and press <b>Generate Playground</b>.</div>',
+                    unsafe_allow_html=True)
         return
+
+    # ---------- ACTIVE ANALYSIS ----------
+    an_ids = [a["analysis_id"] for a in st.session_state.analyses]
+    cur = st.session_state.active_analysis_id
+    idx = an_ids.index(cur) if cur in an_ids else 0
+    sel = st.selectbox("Analysis", an_ids, index=idx,
+                       format_func=lambda a: f"{a} · {analysis_name(a)}")
+    st.session_state.active_analysis_id = sel
+    an = get_analysis(sel)
+    adf = analysis_df(an)
+    if adf is None or adf.empty:
+        st.markdown('<div class="ces-note-warn">The source data for this '
+                    'analysis is no longer processed. Re-process the activity '
+                    'in <b>01 Data + Context</b>.</div>', unsafe_allow_html=True)
+        return
+
+    dim_name = an["comparison_dimension"]["name"]
+    dim_label = ("Group" if dim_name == COMBINED_DIMENSION
+                 else dim_name.split(" /")[0])
+    caps = an.get("capabilities", {})
+    activity = get_activity(an["activity_id"])
+    enabled = [m for m in an["enabled_modules"] if m in MODULE_DEFS]
+
+    # ---------- ANALYSIS HEADER ----------
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="ces-meta" style="line-height:1.9;">'
+            f'<b>Analysis:</b> {an["analysis_name"]} ({an["analysis_id"]})<br>'
+            f'<b>Engagement Activity:</b> {activity_name(an["activity_id"])}<br>'
+            f'<b>Datasets:</b> '
+            f'{", ".join(an["comparison_dimension"]["values"])}<br>'
+            f'<b>Unit of Analysis:</b> {an["unit_of_analysis"]} · '
+            f'<b>Compare by:</b> {dim_label if dim_name != COMBINED_DIMENSION else "— (combined)"}<br>'
+            f'<b>Purpose:</b> {an["purpose"] or "—"}</div>',
+            unsafe_allow_html=True)
+        if an["questions"]:
+            with st.expander(
+                    f"Questions being investigated ({len(an['questions'])})"):
+                for q in an["questions"]:
+                    st.markdown(f"- {q}")
+        if an.get("constraint_ids"):
+            st.markdown("Confirmed relevant constraints: " + "".join(
+                pill(f'{cid} · '
+                     f'{next((c["name"] for c in st.session_state.constraints if c["id"] == cid), cid)}',
+                     "validated") for cid in an["constraint_ids"]),
+                unsafe_allow_html=True)
 
     # constraints drawer — always available in the playground
     with st.sidebar.expander("☷ Project Constraints", expanded=False):
@@ -1274,32 +2149,36 @@ def page_insights():
             if con["description"]:
                 st.caption(con["description"][:160])
 
-    # ---------- HIERARCHY-AWARE FILTER BAR ----------
-    act_ids = list(frames.keys())
-    f1, f2, f3, f4, f5, f6 = st.columns([1.4, 1.4, 1, 1, 1.2, 1.4])
-    f_act = f1.selectbox("Engagement Activity", act_ids,
-                         format_func=activity_name)
-    adf = frames[f_act]
-    activity = get_activity(f_act)
+    # ---------- ANALYSIS-AWARE FILTER BAR (derived from selected data) ----------
     ds_opts = {d["dataset_id"]: (d["dataset_name"] or d["source_file"])
-               for d in activity["datasets"] if d["include"] and d["df"] is not None}
-    f_ds = f2.selectbox("Dataset", ["All"] + list(ds_opts),
-                        format_func=lambda k: ds_opts.get(k, k))
-    f_scen = f3.selectbox("Scenario", ["All"] + sorted(adf["scenario"].unique()))
-    f_reac = f4.selectbox("Reaction", ["All", "approve", "disapprove", "none"])
+               for d in activity["datasets"]
+               if d["dataset_id"] in an["dataset_ids"] and d["df"] is not None}
+    show_reaction = bool(caps.get("reaction", True))
+    fcols = st.columns([1.4, 1.2, 1, 1.2, 1.4] if show_reaction
+                       else [1.4, 1.2, 1.2, 1.4])
+    f_ds = fcols[0].selectbox("Dataset", ["All"] + list(ds_opts),
+                              format_func=lambda k: ds_opts.get(k, k))
+    f_dim = fcols[1].selectbox(dim_label,
+                               ["All"] + sorted(adf["dim_value"].unique()))
+    fi = 2
+    if show_reaction:
+        f_reac = fcols[fi].selectbox("Reaction",
+                                     ["All", "approve", "disapprove", "none"])
+        fi += 1
+    else:
+        f_reac = "All"
     theme_opts = (["All"] +
                   [f'{c["key"]} · {c["ai"]["name"]}'
-                   for c in st.session_state.clusters.values()
-                   if c["status"] in ("ai-suggested", "validated")] +
+                   for c in analysis_clusters(sel).values()] +
                   [f"tag:{t}" for t in all_known_tags()])
-    f_theme = f5.selectbox("Theme / Tag", theme_opts)
-    f_kw = f6.text_input("Keyword", placeholder="Search comments...")
+    f_theme = fcols[fi].selectbox("Theme / Tag", theme_opts)
+    f_kw = fcols[fi + 1].text_input("Keyword", placeholder="Search comments...")
 
     view = adf
     if f_ds != "All":
         view = view[view["dataset_id"] == f_ds]
-    if f_scen != "All":
-        view = view[view["scenario"] == f_scen]
+    if f_dim != "All":
+        view = view[view["dim_value"] == f_dim]
     if f_reac != "All":
         view = view[view["reaction"] == f_reac]
     if f_theme != "All":
@@ -1317,236 +2196,348 @@ def page_insights():
         view = view[view["comment"].str.contains(re.escape(f_kw.strip()),
                                                  case=False, na=False)]
 
-    st.caption(f"{activity_name(f_act)} · {len(view)} comments · "
+    st.caption(f"{an['analysis_name']} · {len(view)} comments · "
                f"{view['response_id'].nunique()} unique response IDs match the "
-               f"current filters (activity total: {len(adf)}).")
+               f"current filters (analysis total: {len(adf)}).")
 
-    tab_over, tab_comments, tab_themes, tab_compare = st.tabs(
-        ["Overview", "Comments", "Themes", "Compare"])
+    # ---------- MODULES (only enabled + supported ones are shown) ----------
+    tabs = st.tabs([MODULE_DEFS[m][0] for m in enabled])
+    module_tabs = dict(zip(enabled, tabs))
+    tab_over = module_tabs.get("overview")
+    tab_comments = module_tabs.get("comments")
+    tab_themes = module_tabs.get("themes")
+    tab_compare = module_tabs.get("compare")
 
     # ---------------- OVERVIEW ----------------
-    with tab_over:
-        m = st.columns(4)
-        m[0].metric("Activity comments", len(adf))
-        m[1].metric("Filtered comments", len(view))
-        m[2].metric("Datasets", len(ds_opts))
-        m[3].metric("Unique response IDs", adf["response_id"].nunique())
-        st.subheader("Participant Reaction by Scenario")
-        st.caption("The reaction field supplied in the dataset is the authoritative "
-                   "reaction variable. This is not AI sentiment.")
-        st.plotly_chart(reaction_chart(view if len(view) else adf),
-                        width="stretch")
-        st.dataframe(scenario_pct_table(view if len(view) else adf),
-                     width="stretch", hide_index=True)
-        if st.button("Save this reaction breakdown as a Quantitative Pattern"):
-            src = view if len(view) else adf
-            add_evidence({
-                "type": "Quantitative Pattern",
-                "record_ids": src["record_id"].tolist(),
-                "scenario": ", ".join(sorted(src["scenario"].unique())),
-                "reaction": None, "counts": reaction_counts(src),
-                "per_scenario": {s: reaction_counts(src[src["scenario"] == s])
-                                 for s in sorted(src["scenario"].unique())},
-                "original_comment": None, "selected_quote": None,
-                "tags": [], "theme_id": None, "status": "Human Selected",
-                **provenance_from_records(src["record_id"].tolist())})
-            st.toast("Quantitative pattern saved (Unassigned — assign it to a "
-                     "theme in the Evidence Library)")
+    if tab_over is not None:
+        with tab_over:
+            m = st.columns(4)
+            m[0].metric("Analysis comments", len(adf))
+            m[1].metric("Filtered comments", len(view))
+            m[2].metric("Datasets", len(ds_opts))
+            m[3].metric("Unique response IDs", adf["response_id"].nunique())
+            if show_reaction:
+                st.subheader(f"Participant Reaction by {dim_label}")
+                st.caption("The reaction field supplied in the dataset is the "
+                           "authoritative reaction variable. This is not AI "
+                           "sentiment.")
+                st.plotly_chart(
+                    reaction_chart(view if len(view) else adf,
+                                   group_label=dim_label), width="stretch")
+                st.dataframe(group_pct_table(view if len(view) else adf,
+                                             dim_label),
+                             width="stretch", hide_index=True)
+            else:
+                st.subheader(f"Comments by {dim_label}")
+                st.caption("No reaction variable exists in these datasets — "
+                           "showing deterministic counts only.")
+                src = view if len(view) else adf
+                per = src.groupby("dim_value").agg(
+                    comments=("record_id", "count"),
+                    unique_response_ids=("response_id", "nunique")
+                ).reset_index().rename(columns={"dim_value": dim_label})
+                st.dataframe(per, width="stretch", hide_index=True)
+            if st.button("Save this breakdown as a Quantitative Pattern"):
+                src = view if len(view) else adf
+                add_evidence({
+                    "type": "Quantitative Pattern",
+                    "record_ids": src["record_id"].tolist(),
+                    "dim_value": ", ".join(sorted(src["dim_value"].unique())),
+                    "reaction": None, "counts": reaction_counts(src),
+                    "per_group": {s: reaction_counts(src[src["dim_value"] == s])
+                                  for s in sorted(src["dim_value"].unique())},
+                    "original_comment": None, "selected_quote": None,
+                    "tags": [], "theme_id": None, "status": "Human Selected",
+                    **provenance_from_records(src["record_id"].tolist())})
+                st.toast("Quantitative pattern saved (Unassigned — assign it "
+                         "to a theme in the Evidence Library)")
 
     # ---------------- COMMENTS ----------------
-    with tab_comments:
-        with st.expander("Bulk tagging (select multiple comments)"):
-            label_map = {rid: f'{rid} · {c[:70]}'
-                         for rid, c in zip(view["record_id"], view["comment"])}
-            sel = st.multiselect("Comments", view["record_id"].tolist(),
-                                 format_func=lambda r: label_map.get(r, r))
-            bt1, bt2 = st.columns(2)
-            btag = bt1.selectbox("Tag", ["—"] + all_known_tags(), key="bulk-tag-sel")
-            bnew = bt2.text_input("Or new tag", key="bulk-tag-new")
-            if st.button("Apply tag to selected"):
-                chosen = bnew.strip() or (btag if btag != "—" else "")
-                if chosen and sel:
-                    for rid in sel:
-                        add_tag(rid, chosen, "human")
-                    st.rerun()
-        page_size = 15
-        n_pages = max(1, (len(view) - 1) // page_size + 1)
-        pg = st.number_input("Page", 1, n_pages, 1) if n_pages > 1 else 1
-        for _, r in view.iloc[(pg - 1) * page_size: pg * page_size].iterrows():
-            comment_card(r, "cx")
-            memberships = [c["ai"]["name"] for c in
-                           st.session_state.clusters.values()
-                           if r["record_id"] in c["record_ids"]
-                           and c["status"] in ("ai-suggested", "validated")]
-            if memberships:
-                st.caption("In themes: " + " · ".join(memberships))
+    if tab_comments is not None:
+        with tab_comments:
+            with st.expander("Bulk tagging (select multiple comments)"):
+                label_map = {rid: f'{rid} · {c[:70]}'
+                             for rid, c in zip(view["record_id"], view["comment"])}
+                bsel = st.multiselect("Comments", view["record_id"].tolist(),
+                                      format_func=lambda r: label_map.get(r, r))
+                bt1, bt2 = st.columns(2)
+                btag = bt1.selectbox("Tag", ["—"] + all_known_tags(),
+                                     key="bulk-tag-sel")
+                bnew = bt2.text_input("Or new tag", key="bulk-tag-new")
+                if st.button("Apply tag to selected"):
+                    chosen = bnew.strip() or (btag if btag != "—" else "")
+                    if chosen and bsel:
+                        for rid in bsel:
+                            add_tag(rid, chosen, "human")
+                        st.rerun()
+            page_size = 15
+            n_pages = max(1, (len(view) - 1) // page_size + 1)
+            pg = st.number_input("Page", 1, n_pages, 1) if n_pages > 1 else 1
+            for _, r in view.iloc[(pg - 1) * page_size: pg * page_size].iterrows():
+                comment_card(r, "cx")
+                memberships = [c["ai"]["name"] for c in
+                               analysis_clusters(sel).values()
+                               if r["record_id"] in c["record_ids"]]
+                if memberships:
+                    st.caption("In themes: " + " · ".join(memberships))
 
     # ---------------- THEMES ----------------
-    with tab_themes:
-        provider, _ = llm_provider()
-        if provider is None:
-            st.markdown('<div class="ces-note-warn">AI theme interpretation '
-                        'unavailable. Configure an API key (ANTHROPIC_API_KEY or '
-                        'OPENAI_API_KEY) to enable AI-generated theme names and '
-                        'summaries. Local clustering still runs; all human '
-                        'workflows remain available.</div>', unsafe_allow_html=True)
+    if tab_themes is not None:
+        with tab_themes:
+            provider, _ = llm_provider()
+            if provider is None:
+                st.markdown('<div class="ces-note-warn">AI theme interpretation '
+                            'unavailable. Configure an API key (ANTHROPIC_API_KEY or '
+                            'OPENAI_API_KEY) to enable AI-generated theme names and '
+                            'summaries. Local clustering still runs; all human '
+                            'workflows remain available.</div>',
+                            unsafe_allow_html=True)
 
-        st.markdown("**Analyze:**")
-        scope = st.radio(
-            "Analysis scope",
-            ["Current Dataset", "Selected Datasets", "Entire Engagement Activity"],
-            horizontal=True, label_visibility="collapsed")
-        if scope == "Current Dataset":
-            if f_ds == "All":
-                st.caption("Select a single dataset in the filter bar above, or "
-                           "choose a wider scope.")
-                scope_df = adf
-                scope_desc = f"{activity_name(f_act)} (all datasets)"
+            st.markdown("**Analyze:**")
+            scope = st.radio(
+                "Analysis scope",
+                ["Current Dataset", "Selected Datasets", "All Analysis Datasets"],
+                index=2, horizontal=True, label_visibility="collapsed")
+            if scope == "Current Dataset":
+                if f_ds == "All":
+                    st.caption("Select a single dataset in the filter bar above, "
+                               "or choose a wider scope.")
+                    scope_df = adf
+                    scope_desc = f"{an['analysis_name']} (all datasets)"
+                else:
+                    scope_df = adf[adf["dataset_id"] == f_ds]
+                    scope_desc = f"{ds_opts.get(f_ds, f_ds)}"
+            elif scope == "Selected Datasets":
+                sel_ds = st.multiselect("Datasets to analyze", list(ds_opts),
+                                        default=list(ds_opts),
+                                        format_func=lambda k: ds_opts[k])
+                scope_df = adf[adf["dataset_id"].isin(sel_ds)]
+                scope_desc = (f"{an['analysis_name']} — {len(sel_ds)} "
+                              "selected datasets")
             else:
-                scope_df = adf[adf["dataset_id"] == f_ds]
-                scope_desc = f"{ds_opts.get(f_ds, f_ds)}"
-        elif scope == "Selected Datasets":
-            sel_ds = st.multiselect("Datasets to analyze", list(ds_opts),
-                                    default=list(ds_opts),
-                                    format_func=lambda k: ds_opts[k])
-            scope_df = adf[adf["dataset_id"].isin(sel_ds)]
-            scope_desc = f"{activity_name(f_act)} — {len(sel_ds)} selected datasets"
-        else:
-            scope_df = adf
-            scope_desc = f"{activity_name(f_act)} (entire activity)"
+                scope_df = adf
+                scope_desc = f"{an['analysis_name']} (all analysis datasets)"
 
-        c1, c2 = st.columns([1, 3])
-        if c1.button("Run Thematic Analysis", type="primary",
-                     disabled=(len(scope_df) == 0)):
-            with st.spinner("Clustering per scenario (TF-IDF + KMeans)"
-                            + (" and asking the LLM to interpret each cluster…"
-                               if provider else "…")):
-                run_thematic_analysis(scope_df, scope_desc)
-            st.rerun()
-        c2.caption(f"Scope: {scope_desc} · {len(scope_df)} comments. Comments are "
-                   "clustered per scenario; dataset and activity provenance is "
-                   "preserved inside every cluster and theme.")
+            c1, c2 = st.columns([1, 3])
+            if c1.button("Run Thematic Analysis", type="primary",
+                         disabled=(len(scope_df) == 0)):
+                with st.spinner(f"Clustering per {dim_label.lower()} "
+                                "(TF-IDF + KMeans)"
+                                + (" and asking the LLM to interpret each "
+                                   "cluster…" if provider else "…")):
+                    run_thematic_analysis(an, scope_df, scope_desc)
+                st.rerun()
+            c2.caption(f"Scope: {scope_desc} · {len(scope_df)} comments. "
+                       f"Comments are clustered per {dim_label.lower()} as "
+                       "configured by this analysis; dataset and activity "
+                       "provenance is preserved inside every cluster and theme.")
 
-        render_create_human_theme(adf)
+            render_create_human_theme(adf)
 
-        if st.session_state.validating_cluster:
-            cl = st.session_state.clusters.get(st.session_state.validating_cluster)
-            if cl:
-                render_validation_form(cl)
-        if st.session_state.cluster_run_done:
-            st.caption(f"Showing clusters from: "
-                       f"{st.session_state.cluster_scope_desc}")
-            for scen in sorted({c["scenario"] for c in
-                                st.session_state.clusters.values()}):
-                scl = [c for c in st.session_state.clusters.values()
-                       if c["scenario"] == scen
-                       and c["status"] in ("ai-suggested", "validated")]
-                if scl:
-                    st.subheader(scen)
-                    for cl in scl:
-                        render_cluster_card(cl)
-        elif not st.session_state.themes:
-            st.caption("No thematic analysis yet — press Run Thematic Analysis.")
+            if st.session_state.validating_cluster:
+                cl = st.session_state.clusters.get(
+                    st.session_state.validating_cluster)
+                if cl and cl.get("analysis_id") == sel:
+                    render_validation_form(cl)
+            an_clusters = analysis_clusters(sel)
+            if an.get("cluster_run_done"):
+                st.caption(f"Showing clusters from: "
+                           f"{an.get('cluster_scope_desc', '')}")
+                for grp in sorted({c["group"] for c in an_clusters.values()}):
+                    gcl = [c for c in an_clusters.values() if c["group"] == grp]
+                    if gcl:
+                        st.subheader(grp)
+                        for cl in gcl:
+                            render_cluster_card(cl)
+            elif not st.session_state.themes:
+                st.caption("No thematic analysis yet — press Run Thematic "
+                           "Analysis.")
 
     # ---------------- COMPARE ----------------
-    with tab_compare:
-        st.subheader("Participant Reaction — Cross-Dataset Comparison")
-        st.plotly_chart(reaction_chart(adf), width="stretch",
-                        key="compare-chart")
-        st.dataframe(scenario_pct_table(adf), width="stretch",
-                     hide_index=True)
-        st.subheader("Themes by Scenario")
-        if not st.session_state.cluster_run_done:
-            st.caption("Run the thematic analysis in the Themes tab first.")
-        else:
-            scens = sorted({c["scenario"] for c in
-                            st.session_state.clusters.values()})
-            scen_cols = st.columns(max(1, len(scens)))
-            for i, scen in enumerate(scens):
-                with scen_cols[i]:
-                    st.markdown(f"**{scen}**")
-                    for c in [c for c in st.session_state.clusters.values()
-                              if c["scenario"] == scen
-                              and c["status"] in ("ai-suggested", "validated")]:
-                        n = max(1, c["n_comments"])
-                        with st.container(border=True):
-                            kind = ("validated" if c["status"] == "validated"
-                                    else "ai")
-                            st.markdown(pills((c["ai"]["name"][:38], kind)),
-                                        unsafe_allow_html=True)
-                            st.markdown(
-                                f'<div class="ces-meta">{c["n_comments"]} comments'
-                                f'<br>Approve {c["counts"]["approve"]/n:.0%} · '
-                                f'Disapprove {c["counts"]["disapprove"]/n:.0%}<br>'
-                                f'{" · ".join(c["keywords"][:4])}</div>',
-                                unsafe_allow_html=True)
-            st.subheader("Patterns Across Scenarios")
-            st.caption("AI-computed proposals from keyword overlap between "
-                       "clusters. All linked to the same engagement activity; "
-                       "proposals remain proposals until reviewed by a human.")
-            for p in cross_scenario_patterns():
-                reviewed = st.session_state.cross_reviews.get(p["key"])
-                with st.container(border=True):
-                    st.markdown(pills(
-                        (p["relationship"], "ai"),
-                        *([("Reviewed", "validated")] if reviewed else [])),
+    if tab_compare is not None:
+        with tab_compare:
+            st.markdown(f'### COMPARE BY: {dim_label}')
+            st.markdown(pills(*[(v, "gray") for v in
+                                an["comparison_dimension"]["values"]]),
                         unsafe_allow_html=True)
-                    names = " + ".join(f'{c["ai"]["name"]} ({c["scenario"]})'
-                                       for c in p["clusters"])
-                    st.markdown(f"**{names}**")
-                    st.markdown(f'<div class="ces-meta">Shared keywords: '
-                                f'{", ".join(p["shared_keywords"][:6]) or "—"} · '
-                                f'Activity: '
-                                f'{activity_name(p["clusters"][0]["activity_ids"][0]) if p["clusters"][0]["activity_ids"] else "—"}'
-                                '</div>', unsafe_allow_html=True)
-                    with st.expander("Supporting comments"):
-                        for c in p["clusters"]:
-                            for rid in c["rep_ids"][:2]:
-                                r = get_record(rid)
-                                if r is not None:
-                                    comment_card(r, f"xs-sup-{p['key']}",
-                                                 show_actions=False)
-                    ctr = [rid for c in p["clusters"]
-                           for rid in c["counter_ids"][:2]]
-                    if ctr:
-                        with st.expander("Contradictory comments"):
-                            for rid in ctr:
-                                r = get_record(rid)
-                                if r is not None:
-                                    comment_card(r, f"xs-ctr-{p['key']}",
-                                                 show_actions=False)
-                    if not reviewed:
-                        if st.button("Review — mark as human-reviewed",
-                                     key=f"xsrev-{p['key']}"):
-                            st.session_state.cross_reviews[p["key"]] = {
-                                "date": datetime.date.today().isoformat()}
-                            st.rerun()
-                    else:
-                        if st.button("Save as Cross-Scenario Pattern (evidence)",
-                                     key=f"xssave-{p['key']}"):
-                            rids = sorted({rid for c in p["clusters"]
-                                           for rid in c["record_ids"]})
-                            sub = records_for(rids)
-                            add_evidence({
-                                "type": "Cross-Scenario Pattern",
-                                "record_ids": rids,
-                                "scenario": ", ".join(
-                                    sorted(sub["scenario"].unique())),
-                                "reaction": None,
-                                "counts": reaction_counts(sub),
-                                "original_comment": None,
-                                "selected_quote": None,
-                                "pattern_label": f'{p["relationship"]}: ' +
-                                " + ".join(c["ai"]["name"]
-                                           for c in p["clusters"]),
-                                "tags": p["shared_keywords"][:5],
-                                "theme_id": None, "status": "Human Reviewed",
-                                **provenance_from_records(rids)})
-                            st.toast("Cross-scenario pattern saved (Unassigned)")
+            if show_reaction:
+                st.subheader("Participant Reaction")
+                st.plotly_chart(reaction_chart(adf, group_label=dim_label),
+                                width="stretch", key="compare-chart")
+                st.dataframe(group_pct_table(adf, dim_label), width="stretch",
+                             hide_index=True)
+            an_clusters = analysis_clusters(sel)
+            st.subheader(f"Themes by {dim_label}")
+            if not an.get("cluster_run_done"):
+                st.caption("Run the thematic analysis in the Themes tab first.")
+            else:
+                grps = sorted({c["group"] for c in an_clusters.values()})
+                grp_cols = st.columns(max(1, len(grps)))
+                for i, grp in enumerate(grps):
+                    with grp_cols[i]:
+                        st.markdown(f"**{grp}**")
+                        for c in [c for c in an_clusters.values()
+                                  if c["group"] == grp]:
+                            n = max(1, c["n_comments"])
+                            with st.container(border=True):
+                                kind = ("validated" if c["status"] == "validated"
+                                        else "ai")
+                                st.markdown(pills((c["ai"]["name"][:38], kind)),
+                                            unsafe_allow_html=True)
+                                st.markdown(
+                                    f'<div class="ces-meta">{c["n_comments"]} comments'
+                                    f'<br>Approve {c["counts"]["approve"]/n:.0%} · '
+                                    f'Disapprove {c["counts"]["disapprove"]/n:.0%}<br>'
+                                    f'{" · ".join(c["keywords"][:4])}</div>',
+                                    unsafe_allow_html=True)
+                st.subheader(f"Patterns Across {dim_label}s")
+                st.caption("AI-computed proposals from keyword overlap between "
+                           "clusters. All linked to the same engagement activity; "
+                           "proposals remain proposals until reviewed by a human.")
+                for p in cross_group_patterns(an):
+                    reviewed = st.session_state.cross_reviews.get(p["key"])
+                    with st.container(border=True):
+                        st.markdown(pills(
+                            (p["relationship"], "ai"),
+                            *([("Reviewed", "validated")] if reviewed else [])),
+                            unsafe_allow_html=True)
+                        names = " + ".join(f'{c["ai"]["name"]} ({c["group"]})'
+                                           for c in p["clusters"])
+                        st.markdown(f"**{names}**")
+                        st.markdown(f'<div class="ces-meta">Shared keywords: '
+                                    f'{", ".join(p["shared_keywords"][:6]) or "—"} · '
+                                    f'Activity: '
+                                    f'{activity_name(p["clusters"][0]["activity_ids"][0]) if p["clusters"][0]["activity_ids"] else "—"}'
+                                    '</div>', unsafe_allow_html=True)
+                        with st.expander("Supporting comments"):
+                            for c in p["clusters"]:
+                                for rid in c["rep_ids"][:2]:
+                                    r = get_record(rid)
+                                    if r is not None:
+                                        comment_card(r, f"xs-sup-{p['key']}",
+                                                     show_actions=False)
+                        ctr = [rid for c in p["clusters"]
+                               for rid in c["counter_ids"][:2]]
+                        if ctr:
+                            with st.expander("Contradictory comments"):
+                                for rid in ctr:
+                                    r = get_record(rid)
+                                    if r is not None:
+                                        comment_card(r, f"xs-ctr-{p['key']}",
+                                                     show_actions=False)
+                        if not reviewed:
+                            if st.button("Review — mark as human-reviewed",
+                                         key=f"xsrev-{p['key']}"):
+                                st.session_state.cross_reviews[p["key"]] = {
+                                    "date": datetime.date.today().isoformat()}
+                                st.rerun()
+                        else:
+                            if st.button(f"Save as Cross-{dim_label} Pattern "
+                                         "(evidence)",
+                                         key=f"xssave-{p['key']}"):
+                                rids = sorted({rid for c in p["clusters"]
+                                               for rid in c["record_ids"]})
+                                sub = records_for(rids)
+                                add_evidence({
+                                    "type": "Cross-Group Pattern",
+                                    "record_ids": rids,
+                                    "dim_value": ", ".join(
+                                        sorted(sub["dim_value"].unique())),
+                                    "reaction": None,
+                                    "counts": reaction_counts(sub),
+                                    "original_comment": None,
+                                    "selected_quote": None,
+                                    "pattern_label": f'{p["relationship"]}: ' +
+                                    " + ".join(c["ai"]["name"]
+                                               for c in p["clusters"]),
+                                    "tags": p["shared_keywords"][:5],
+                                    "theme_id": None, "status": "Human Reviewed",
+                                    **provenance_from_records(rids)})
+                                st.toast(f"Cross-{dim_label.lower()} pattern "
+                                         "saved (Unassigned)")
+
+    # ---------------- MAP (only when coordinates exist) ----------------
+    if "map" in module_tabs:
+        with module_tabs["map"]:
+            st.subheader("Spatial Distribution")
+            if "lat" in view.columns and "lon" in view.columns:
+                pts = view.dropna(subset=["lat", "lon"])
+                pts = pts[pd.to_numeric(pts["lat"], errors="coerce").notna()
+                          & pd.to_numeric(pts["lon"], errors="coerce").notna()]
+                if len(pts):
+                    st.map(pts.assign(lat=pd.to_numeric(pts["lat"]),
+                                      lon=pd.to_numeric(pts["lon"]))
+                           [["lat", "lon"]])
+                    st.caption(f"{len(pts)} records with coordinates "
+                               "(current filters applied).")
+                else:
+                    st.caption("No records with valid coordinates match the "
+                               "current filters.")
+            else:
+                st.caption("No coordinate fields in the current view.")
+
+    # ---------------- TIMELINE (only when dates exist) ----------------
+    if "timeline" in module_tabs:
+        with module_tabs["timeline"]:
+            st.subheader("Comments Over Time")
+            if "record_date" in view.columns:
+                tl = view.copy()
+                tl["record_date"] = pd.to_datetime(tl["record_date"],
+                                                   errors="coerce")
+                tl = tl.dropna(subset=["record_date"])
+                if len(tl):
+                    per = tl.groupby([pd.Grouper(key="record_date", freq="W"),
+                                      "dim_value"]).size().reset_index(name="comments")
+                    fig = go.Figure()
+                    for grp in sorted(per["dim_value"].unique()):
+                        g = per[per["dim_value"] == grp]
+                        fig.add_scatter(x=g["record_date"], y=g["comments"],
+                                        name=grp, mode="lines+markers")
+                    fig.update_layout(height=340, plot_bgcolor="#FFFFFF",
+                                      paper_bgcolor="#FFFFFF",
+                                      font=dict(color=C["text"], size=13),
+                                      legend=dict(title=dim_label))
+                    st.plotly_chart(fig, width="stretch")
+                else:
+                    st.caption("No parseable dates in the current view.")
+            else:
+                st.caption("No date fields in the current view.")
+
+    # ------------- RANKINGS / STAKEHOLDERS (capability-gated) -------------
+    if "rankings" in module_tabs:
+        with module_tabs["rankings"]:
+            st.subheader("Ranking Analysis")
+            rank_cols = [c for c in view.columns
+                         if any(h in c for h in _RANK_HINTS)
+                         and pd.api.types.is_numeric_dtype(view[c])]
+            if rank_cols:
+                agg = view.groupby("dim_value")[rank_cols].mean().round(2)
+                agg.index.name = dim_label
+                st.dataframe(agg.reset_index(), width="stretch",
+                             hide_index=True)
+                st.caption("Mean values of detected ranking fields, by "
+                           f"{dim_label.lower()}. Deterministic Python "
+                           "calculations.")
+            else:
+                st.caption("No numeric ranking fields in the current view.")
+
+    if "stakeholders" in module_tabs:
+        with module_tabs["stakeholders"]:
+            st.subheader("Stakeholder / Demographic Comparison")
+            demo_cols = [c for c in view.columns
+                         if any(h in c for h in _DEMO_HINTS)]
+            if demo_cols:
+                dcol = st.selectbox("Demographic field", demo_cols)
+                per = view.groupby([dcol, "reaction"]).size().reset_index(
+                    name="comments") if show_reaction else \
+                    view.groupby(dcol).size().reset_index(name="comments")
+                st.dataframe(per, width="stretch", hide_index=True)
+            else:
+                st.caption("No demographic fields in the current view.")
 
 
 # ----------------------------------------------------------------------------
-# PAGE 03 — LIBRARIES  (theme-centric Evidence Library)
+# PAGE 04 — LIBRARIES  (theme-centric Evidence Library)
 # ----------------------------------------------------------------------------
 
 def evidence_snippet(ev):
@@ -1564,13 +2555,17 @@ def evidence_snippet(ev):
 
 
 def render_evidence_item(ev, key_prefix, theme=None):
-    """Compact evidence item: ID · type · scenario · reaction, snippet beneath."""
+    """Compact evidence item: ID · type · group · reaction, snippet beneath."""
     with st.container(border=True):
         head = [(ev["evidence_id"], "gray"), (ev["type"], "human")]
-        if ev.get("scenario"):
-            head.append((str(ev["scenario"])[:28], "gray"))
+        group = ev.get("dim_value") or ev.get("scenario")
+        if group:
+            head.append((str(group)[:28], "gray"))
         if ev.get("reaction"):
             head.append((ev["reaction"].title(), ev["reaction"]))
+        if ev.get("analysis_id"):
+            head.append((f'Analysis: {analysis_name(ev["analysis_id"])}'[:38],
+                         "human"))
         st.markdown(pills(*head), unsafe_allow_html=True)
         snip = evidence_snippet(ev)
         if snip:
@@ -1592,7 +2587,9 @@ def render_evidence_item(ev, key_prefix, theme=None):
             with st.popover("Traceability"):
                 prov = provenance_from_records(ev.get("record_ids", []))
                 chain = ("PROJECT\n  ↓\nENGAGEMENT ACTIVITY\n  ↓\nDATASET\n  ↓\n"
-                         "RAW RECORD\n  ↓\nEVIDENCE ITEM"
+                         "RAW RECORD"
+                         + ("\n  ↓\nANALYSIS" if ev.get("analysis_id") else "")
+                         + "\n  ↓\nEVIDENCE ITEM"
                          + ("\n  ↓\nTHEME" if ev.get("theme_id") else ""))
                 st.markdown(f'<div class="ces-chain">{chain}</div>',
                             unsafe_allow_html=True)
@@ -1604,6 +2601,8 @@ def render_evidence_item(ev, key_prefix, theme=None):
                     f'{", ".join(activity_name(a) for a in prov["activity_ids"]) or "—"}<br>'
                     f'<b>Dataset(s):</b> {", ".join(prov["dataset_ids"]) or "—"}<br>'
                     f'<b>Source file(s):</b> {", ".join(prov["source_files"]) or "—"}<br>'
+                    f'<b>Analysis:</b> '
+                    f'{analysis_name(ev["analysis_id"]) if ev.get("analysis_id") else "—"}<br>'
                     f'<b>Record IDs:</b> {len(ev.get("record_ids", []))} · '
                     f'<b>Response IDs:</b> {len(prov["response_ids"])}<br>'
                     f'<b>Status:</b> {ev["status"]} · <b>Created:</b> {ev["created"]}'
@@ -1625,6 +2624,15 @@ def render_evidence_item(ev, key_prefix, theme=None):
 
 def render_theme_expanded(theme):
     """Expanded theme: interpretation, tags, reactions, provenance, evidence."""
+    st.markdown(
+        f'<div class="ces-meta" style="margin-bottom:8px;">'
+        f'<b>Analysis of Origin:</b> '
+        f'{analysis_name(theme["analysis_id"]) if theme.get("analysis_id") else "— (created outside an analysis)"} · '
+        f'<b>Engagement Activity:</b> '
+        f'{", ".join(activity_name(a) for a in theme.get("activity_ids", [])) or "—"} · '
+        f'<b>Datasets Represented:</b> '
+        f'{", ".join(theme.get("dim_values", [])) or ", ".join(theme.get("dataset_ids", [])) or "—"}'
+        '</div>', unsafe_allow_html=True)
     st.markdown("**Theme Interpretation**")
     st.markdown(f'<div class="ces-note-human"><b>Human interpretation:</b> '
                 f'{theme["interpretation"] or "—"}</div>', unsafe_allow_html=True)
@@ -1647,10 +2655,13 @@ def render_theme_expanded(theme):
 
     st.markdown(
         "**Datasets Represented** " +
-        pills(*[(s, "gray") for s in theme.get("scenarios", [])]) + "<br>" +
+        pills(*[(s, "gray") for s in theme.get("dim_values", [])]) + "<br>" +
         "**Engagement Activity** " +
         pills(*[(activity_name(a), "gray")
-                for a in theme.get("activity_ids", [])]),
+                for a in theme.get("activity_ids", [])]) + "<br>" +
+        "**Analysis of Origin** " +
+        pills((analysis_name(theme["analysis_id"]), "human")
+              if theme.get("analysis_id") else ("—", "gray")),
         unsafe_allow_html=True)
 
     if theme.get("constraints"):
@@ -1675,7 +2686,8 @@ def render_theme_expanded(theme):
     theme_ev = [e for e in st.session_state.evidence
                 if e.get("theme_id") == theme["theme_id"]]
     quant_ev = [e for e in theme_ev
-                if e["type"] in ("Quantitative Pattern", "Cross-Scenario Pattern")]
+                if e["type"] in ("Quantitative Pattern", "Cross-Group Pattern",
+                                 "Cross-Scenario Pattern")]
     key_ev = [e for e in theme_ev
               if e["type"] in ("Highlighted Quote", "Direct Comment")]
     other_ev = [e for e in theme_ev if e not in quant_ev and e not in key_ev]
@@ -1749,23 +2761,33 @@ def page_libraries():
         m[3].metric("Datasets Represented", len(dsets))
 
         # ---------- filters: themes first, then evidence inside ----------
-        fc1, fc2, fc3, fc4, fc5, fc6 = st.columns([1.3, 1.1, 1.1, 1, 1, 1.4])
-        lf_act = fc1.selectbox("Engagement Activity", ["All"] + acts,
+        an_ids = sorted({t.get("analysis_id") for t in themes
+                         if t.get("analysis_id")}
+                        | {e.get("analysis_id") for e in evidence
+                           if e.get("analysis_id")})
+        fc1, fc2, fc3, fc4, fc5, fc6, fc7 = st.columns(
+            [1.2, 1.2, 1, 1, 1, 1, 1.3])
+        lf_an = fc1.selectbox("Analysis", ["All"] + an_ids,
+                              format_func=lambda a: a if a == "All"
+                              else f"{a} · {analysis_name(a)}")
+        lf_act = fc2.selectbox("Engagement Activity", ["All"] + acts,
                                format_func=lambda a: a if a == "All"
                                else activity_name(a))
-        lf_scen = fc2.selectbox(
-            "Dataset / Scenario",
-            ["All"] + sorted({s for t in themes for s in t.get("scenarios", [])}))
-        lf_status = fc3.selectbox("Validation Status", ["All", "Human Validated"])
-        lf_tag = fc4.selectbox("Tag", ["All"] + all_known_tags())
-        lf_reac = fc5.selectbox("Reaction",
+        lf_dim = fc3.selectbox(
+            "Dataset Value",
+            ["All"] + sorted({s for t in themes for s in t.get("dim_values", [])}))
+        lf_status = fc4.selectbox("Validation Status", ["All", "Human Validated"])
+        lf_tag = fc5.selectbox("Tag", ["All"] + all_known_tags())
+        lf_reac = fc6.selectbox("Reaction",
                                 ["All", "approve", "disapprove", "none"])
-        lf_q = fc6.text_input("Search Themes", placeholder="Search themes…")
+        lf_q = fc7.text_input("Search Themes", placeholder="Search themes…")
 
         def theme_matches(t):
+            if lf_an != "All" and t.get("analysis_id") != lf_an:
+                return False
             if lf_act != "All" and lf_act not in t.get("activity_ids", []):
                 return False
-            if lf_scen != "All" and lf_scen not in t.get("scenarios", []):
+            if lf_dim != "All" and lf_dim not in t.get("dim_values", []):
                 return False
             if lf_status != "All" and t["status"].title() != lf_status:
                 return False
@@ -1795,9 +2817,11 @@ def page_libraries():
                 st.markdown(
                     pills((theme["theme_id"], "gray"),
                           ("Human Validated", "validated"),
+                          *([(f'Analysis: {analysis_name(theme["analysis_id"])}',
+                              "human")] if theme.get("analysis_id") else []),
                           *[(activity_name(a), "gray")
                             for a in theme.get("activity_ids", [])],
-                          *[(s, "gray") for s in theme.get("scenarios", [])]),
+                          *[(s, "gray") for s in theme.get("dim_values", [])]),
                     unsafe_allow_html=True)
                 if theme["interpretation"]:
                     st.markdown(f'<div class="ces-meta">“'
@@ -1840,8 +2864,13 @@ def page_libraries():
                                     ev.get("record_ids", []))
                                 sub = records_for(ev.get("record_ids", []))
                                 theme_id = next_id("theme_seq", "TH-")
+                                ev_an = get_analysis(ev.get("analysis_id"))
                                 st.session_state.themes.append({
                                     "theme_id": theme_id, "origin": "human",
+                                    "analysis_id": ev.get("analysis_id"),
+                                    "dimension": (
+                                        ev_an["comparison_dimension"]["name"]
+                                        if ev_an else None),
                                     "ai_original_name": None,
                                     "ai_original_summary": None,
                                     "ai_source": None, "name": tn.strip(),
@@ -1911,7 +2940,7 @@ def page_libraries():
 
 
 # ----------------------------------------------------------------------------
-# PAGE 04 — DECISION TRAILS
+# PAGE 05 — DECISION TRAILS
 # ----------------------------------------------------------------------------
 
 DECISION_DIAGRAM = (
@@ -1927,13 +2956,17 @@ def page_decisions():
     st.title("Decision Trails")
     st.markdown(f'<p style="color:{C["text2"]};">Document how themes, evidence, '
                 'constraints, trade-offs, and judgment shaped a planning decision. '
-                'Inputs are <b>considered</b> — evidence does not automatically '
-                'cause a decision.</p>', unsafe_allow_html=True)
+                'Inputs can be pulled from <b>multiple analyses</b> and multiple '
+                'engagement activities — each input preserves where it '
+                'originated. Inputs are <b>considered</b> — evidence does not '
+                'automatically cause a decision.</p>', unsafe_allow_html=True)
     st.markdown(f'<div class="ces-chain">{DECISION_DIAGRAM}</div>',
                 unsafe_allow_html=True)
 
     theme_opts = {t["theme_id"]: f'{t["theme_id"]} · {t["name"]} '
-                                 f'({len(t["record_ids"])} records)'
+                                 f'({len(t["record_ids"])} records'
+                                 + (f' · {analysis_name(t["analysis_id"])}'
+                                    if t.get("analysis_id") else "") + ")"
                   for t in st.session_state.themes}
     ev_opts = {e["evidence_id"]: f'{e["evidence_id"]} · {e["type"]} · '
                                  f'{evidence_snippet(e)[:50]}'
@@ -2016,10 +3049,13 @@ def page_decisions():
                 for tid in dec.get("themes", []):
                     th = get_theme(tid)
                     if th:
+                        origin = (f' · from {analysis_name(th["analysis_id"])}'
+                                  if th.get("analysis_id") else "")
                         st.markdown(pills(("THEME", "validated"),
                                           (th["name"], "gray")) +
                                     f'<span class="ces-meta"> '
-                                    f'{len(th["record_ids"])} records</span>',
+                                    f'{len(th["record_ids"])} records'
+                                    f'{origin}</span>',
                                     unsafe_allow_html=True)
                         with st.expander("View Evidence Used"):
                             st.markdown(f'<div class="ces-meta">'
@@ -2075,16 +3111,21 @@ def main():
         st.markdown("## Civic Evidence Studio")
         st.caption(f'{proj["metadata"]["project_name"]} · '
                    f'{proj["metadata"]["project_phase"]}')
-        page = st.radio("Navigate", ["01 Data + Context", "02 Insights Playground",
-                                     "03 Libraries", "04 Decision Trails"],
+        page = st.radio("Navigate", ["01 Data + Context", "02 Analysis Setup",
+                                     "03 Insights Playground", "04 Libraries",
+                                     "05 Decision Trails"],
                         label_visibility="collapsed")
         st.divider()
         n_act = len(all_activities())
         n_ds = sum(len(a["datasets"]) for a in all_activities())
         processed = sum(1 for a in all_activities() if a["combined"] is not None)
+        active = active_analysis()
         st.caption(
             f"Activities: {n_act} ({processed} processed)\n\n"
             f"Datasets: {n_ds}\n\n"
+            f"Analyses: {len(st.session_state.analyses)}"
+            + (f" (active: {active['analysis_name']})" if active else "")
+            + "\n\n"
             f"Themes: {len(st.session_state.themes)}\n\n"
             f"Evidence items: {len(st.session_state.evidence)}\n\n"
             f"Constraints: {len(st.session_state.constraints)}\n\n"
@@ -2092,14 +3133,17 @@ def main():
         provider, _ = llm_provider()
         st.markdown(pill("AI: " + (provider if provider else "not configured"),
                          "ai" if provider else "review"), unsafe_allow_html=True)
-        st.caption("PROJECT → ACTIVITY → DATASET → RECORD → THEME → EVIDENCE "
-                   "→ DECISION. Provenance is preserved at every level.")
+        st.caption("PROJECT → ACTIVITY → DATASET → RECORD → ANALYSIS → "
+                   "AI-SUGGESTED PATTERN → HUMAN THEME → EVIDENCE → DECISION. "
+                   "Provenance is preserved at every level.")
 
     if page == "01 Data + Context":
         page_data_context()
-    elif page == "02 Insights Playground":
+    elif page == "02 Analysis Setup":
+        page_analysis_setup()
+    elif page == "03 Insights Playground":
         page_insights()
-    elif page == "03 Libraries":
+    elif page == "04 Libraries":
         page_libraries()
     else:
         page_decisions()
