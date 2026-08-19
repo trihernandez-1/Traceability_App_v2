@@ -72,17 +72,24 @@ Then in the app:
    demo, Neighborhood or anything else for other activities. Thematic
    analysis clusters per dimension value (TF-IDF + KMeans) with AI-suggested
    names; every underlying comment, including counter-evidence, is
-   inspectable before validating into themes. The **Theme Map** module plots
-   every comment in semantic space (TF-IDF → SVD; the axes are unnamed
-   semantic dimensions, not planning concepts): point color is the
-   participant reaction, theme boundaries/labels use status colors (AI
-   Purple / Human Blue / Validated Green), ambiguous low-confidence members
-   render faded, and counter-evidence gets a Conflict Red ring. Lasso-select
-   points to add/remove them from themes or create a new theme from the
-   selection — AI clustering is a suggestion, not a final classification. A
-   Reaction Spectrum view shows which themes lean approve, disapprove, or
-   disagree internally, and theme validation includes a visual cluster
-   review.
+   inspectable before validating into themes. The **Theme Map** module is a
+   two-level exploration. **Level 1 — Theme Overview** shows only themes as
+   points (never thousands of comments): position = semantic similarity
+   between themes, size = comment count, fill = dominant participant
+   reaction (Mostly Approve / Mostly Disapprove / Mixed), outline = theme
+   status (AI Purple / Human Blue / Validated Green); a Reaction Spectrum
+   view shows which themes lean approve, disapprove, or split. Clicking a
+   theme opens **Level 2 — Theme Detail**: the theme becomes its own
+   analytical space, with each comment colored by relationship strength
+   (Core blue / Related purple / Edge yellow from measured centroid
+   similarity — never opacity), bordered by participant reaction, semantic
+   outliers as diamonds and interpretive outliers ringed Conflict Red, an
+   optional AI-suggested (human accept/rename/reject) Interpretable Axes
+   mode, AI-suggested subthemes (accept / rename / merge / reject / create
+   from selection), and lasso-driven correction (remove, move, subtheme, or
+   new theme from selected comments). Validation happens through an
+   explicit review of the diversity inside the theme, and edits flow back
+   to the overview.
 4. **04 Libraries** — the Evidence Library is organized around THEMES, and
    every theme shows its **Analysis of Origin**, engagement activity, and
    datasets represented — so one activity can support multiple analyses
