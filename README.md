@@ -72,7 +72,17 @@ Then in the app:
    demo, Neighborhood or anything else for other activities. Thematic
    analysis clusters per dimension value (TF-IDF + KMeans) with AI-suggested
    names; every underlying comment, including counter-evidence, is
-   inspectable before validating into themes.
+   inspectable before validating into themes. The **Theme Map** module plots
+   every comment in semantic space (TF-IDF → SVD; the axes are unnamed
+   semantic dimensions, not planning concepts): point color is the
+   participant reaction, theme boundaries/labels use status colors (AI
+   Purple / Human Blue / Validated Green), ambiguous low-confidence members
+   render faded, and counter-evidence gets a Conflict Red ring. Lasso-select
+   points to add/remove them from themes or create a new theme from the
+   selection — AI clustering is a suggestion, not a final classification. A
+   Reaction Spectrum view shows which themes lean approve, disapprove, or
+   disagree internally, and theme validation includes a visual cluster
+   review.
 4. **04 Libraries** — the Evidence Library is organized around THEMES, and
    every theme shows its **Analysis of Origin**, engagement activity, and
    datasets represented — so one activity can support multiple analyses

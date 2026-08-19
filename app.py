@@ -189,6 +189,8 @@ MODULE_DEFS = {
     "compare":   ("Compare", "multi_group",
                   "Only one dataset dimension value is available — "
                   "nothing to compare."),
+    "theme_map": ("Theme Map", "text",
+                  "No open-ended text fields exist in the selected datasets."),
     "map":       ("Map", "coords",
                   "No geographic coordinates exist in the selected datasets."),
     "timeline":  ("Timeline", "dates",
@@ -814,6 +816,11 @@ def cluster_one_group(sdf):
         sims = np.asarray(X[idx].dot(center)).ravel()
         order = np.argsort(sims)[::-1]
         rep_ids = sub.iloc[order[:5]]["record_id"].tolist()
+        # similarity to the cluster center, normalized per cluster → a
+        # human-review signal: low-confidence members are ambiguous, not wrong
+        smax = float(sims.max()) if len(sims) and float(sims.max()) > 0 else 1.0
+        confidence = {rid: round(float(s) / smax, 3)
+                      for rid, s in zip(sub["record_id"], sims)}
         counts = reaction_counts(sub)
         if counts["approve"] >= counts["disapprove"]:
             majority, minority = "approve", "disapprove"
@@ -830,6 +837,7 @@ def cluster_one_group(sdf):
             "counts": counts, "majority": majority,
             "counter_ids": sub[sub["reaction"] == minority]["record_id"].tolist(),
             "keywords": top_terms, "rep_ids": rep_ids,
+            "confidence": confidence,
         })
     clusters.sort(key=lambda c: -c["n_comments"])
     return clusters
@@ -1356,7 +1364,7 @@ def recommended_modules(caps, goals):
     """Recommended module set from data capabilities + user goals."""
     rec = ["overview"]
     if caps.get("text"):
-        rec += ["comments", "themes"]
+        rec += ["comments", "themes", "theme_map"]
     if caps.get("multi_group"):
         rec.append("compare")
     if caps.get("coords") and "Spatial patterns" in goals:
@@ -1912,6 +1920,17 @@ def render_validation_form(cluster):
     st.markdown('<div class="ces-note-human">Keep the theme name SHORT (2–4 words). '
                 'The AI original name and summary are preserved unchanged alongside '
                 'your interpretation.</div>', unsafe_allow_html=True)
+    val_an = get_analysis(cluster.get("analysis_id"))
+    if val_an:
+        st.markdown("**Visual Cluster Review** — inspect the grouping before "
+                    "validating: comments at the center vs the edge (faded = "
+                    "ambiguous), counter-evidence (red ring), reaction "
+                    "distribution, and overlap with other themes.")
+        if not theme_mini_map(val_an, cluster["record_ids"],
+                              cluster["counter_ids"],
+                              key=f"valmap-{key}"):
+            st.caption("Semantic map unavailable for this analysis "
+                       "(too few comments).")
     sub = records_for(cluster["record_ids"])
     label_map = {rid: f'{rid} · {sub[sub["record_id"] == rid]["comment"].iloc[0][:80]}'
                  for rid in cluster["record_ids"]}
@@ -2075,6 +2094,670 @@ def cross_group_patterns(analysis):
                              "clusters": [c],
                              "shared_keywords": c["keywords"][:4]})
     return patterns
+
+
+# ----------------------------------------------------------------------------
+# THEME MAP (semantic map of comments — AI suggests, humans inspect & correct)
+# ----------------------------------------------------------------------------
+
+# Theme/cluster styling per status. Reaction color on points is authoritative
+# and never replaced — these colors are used for boundaries/labels only.
+GROUP_STATUS_COLOR = {"ai": C["purple"], "human": C["blue"],
+                      "validated": C["green"]}
+GROUP_STATUS_LABEL = {"ai": "AI Suggested Theme",
+                      "human": "Human Created Theme",
+                      "validated": "Human Validated Theme"}
+AMBIGUITY_THRESHOLD = 0.4  # normalized similarity below this = ambiguous
+
+SEMANTIC_AXES_NOTE = (
+    "Position represents similarity in comment meaning. Nearby comments use "
+    "semantically similar language. The axes themselves do not represent "
+    "predefined planning concepts.")
+
+
+def get_semantic_coords(analysis, adf):
+    """2D semantic coordinates for every comment in one analysis:
+    TF-IDF → TruncatedSVD (LSA). Cached per analysis; recomputed when the
+    record set changes. Axes are unnamed semantic dimensions — no conceptual
+    meaning is invented for them."""
+    from sklearn.decomposition import TruncatedSVD
+    cache = st.session_state.setdefault("semantic_maps", {})
+    sig = (analysis["analysis_id"], len(adf),
+           adf["record_id"].iloc[0], adf["record_id"].iloc[-1])
+    entry = cache.get(analysis["analysis_id"])
+    if entry and entry["sig"] == sig:
+        return entry
+    texts = adf["comment"].fillna("").astype(str).tolist()
+    if len(texts) < 4:
+        return None
+    vec = TfidfVectorizer(stop_words="english", max_features=2500,
+                          ngram_range=(1, 2), min_df=1)
+    try:
+        X = vec.fit_transform(texts)
+    except ValueError:
+        return None
+    if X.shape[1] < 3:
+        return None
+    coords = TruncatedSVD(n_components=2, random_state=42).fit_transform(X)
+    entry = {"sig": sig,
+             "x": dict(zip(adf["record_id"], coords[:, 0].round(4))),
+             "y": dict(zip(adf["record_id"], coords[:, 1].round(4)))}
+    cache[analysis["analysis_id"]] = entry
+    return entry
+
+
+def theme_groups(analysis_id):
+    """Unified view of this analysis's groupings: AI-suggested clusters plus
+    validated/human themes, each with status, records, and counter-evidence."""
+    groups = []
+    for key, cl in analysis_clusters(analysis_id,
+                                     statuses=("ai-suggested",)).items():
+        groups.append({"gid": key, "kind": "cluster", "name": cl["ai"]["name"],
+                       "status": "ai", "record_ids": cl["record_ids"],
+                       "counter_ids": cl["counter_ids"],
+                       "confidence": cl.get("confidence", {}), "obj": cl})
+    for th in st.session_state.themes:
+        if th.get("analysis_id") != analysis_id:
+            continue
+        status = "validated" if th.get("origin") == "ai-validated" else "human"
+        groups.append({"gid": th["theme_id"], "kind": "theme",
+                       "name": th["name"], "status": status,
+                       "record_ids": th["record_ids"],
+                       "counter_ids": th.get("counter_ids", []),
+                       "confidence": {}, "obj": th})
+    return groups
+
+
+def refresh_cluster_records(cl, record_ids):
+    """Recompute a cluster's calculated fields after a human edits its
+    membership. Deterministic Python only; AI name/summary untouched."""
+    sub = records_for(sorted(set(record_ids)))
+    cl["record_ids"] = sub["record_id"].tolist()
+    cl["n_comments"] = int(len(sub))
+    cl["n_respondents"] = int(sub["response_id"].nunique()) if len(sub) else 0
+    cl["counts"] = reaction_counts(sub) if len(sub) else \
+        {"approve": 0, "disapprove": 0, "none": 0}
+    maj = "approve" if cl["counts"]["approve"] >= cl["counts"]["disapprove"] \
+        else "disapprove"
+    minr = "disapprove" if maj == "approve" else "approve"
+    cl["majority"] = maj
+    cl["counter_ids"] = sub[sub["reaction"] == minr]["record_id"].tolist()
+    cl["dataset_ids"] = sorted(sub["dataset_id"].unique().tolist())
+    cl["source_files"] = sorted(sub["source_file"].unique().tolist())
+    cl["activity_ids"] = sorted(sub["activity_id"].unique().tolist())
+    cl["rep_ids"] = [r for r in cl.get("rep_ids", [])
+                     if r in cl["record_ids"]]
+    cl.setdefault("human_edited", True)
+
+
+def refresh_theme_records(th, record_ids):
+    """Recompute a validated theme's calculated fields after a human edits
+    its membership. Provenance is refreshed from the actual records."""
+    ids = sorted(set(record_ids))
+    sub = records_for(ids)
+    th["record_ids"] = ids
+    th["counts"] = reaction_counts(sub) if len(sub) else \
+        {"approve": 0, "disapprove": 0, "none": 0}
+    th["n_respondents"] = int(sub["response_id"].nunique()) if len(sub) else 0
+    th["counter_ids"] = [r for r in th.get("counter_ids", []) if r in ids]
+    th.update(provenance_from_records(ids))
+
+
+def add_records_to_group(group, record_ids):
+    merged = set(group["record_ids"]) | set(record_ids)
+    if group["kind"] == "cluster":
+        refresh_cluster_records(group["obj"], merged)
+    else:
+        refresh_theme_records(group["obj"], merged)
+
+
+def remove_records_from_group(group, record_ids):
+    remaining = set(group["record_ids"]) - set(record_ids)
+    if group["kind"] == "cluster":
+        refresh_cluster_records(group["obj"], remaining)
+    else:
+        refresh_theme_records(group["obj"], remaining)
+
+
+def _build_theme_map_points(an, view, coords):
+    """Plot-ready dataframe: one row per original comment in the current
+    view, with semantic coordinates, group membership, confidence, and
+    counter-evidence flags. Points never detach from their source records."""
+    pts = view.copy()
+    pts["semantic_x"] = pts["record_id"].map(coords["x"])
+    pts["semantic_y"] = pts["record_id"].map(coords["y"])
+    pts = pts.dropna(subset=["semantic_x", "semantic_y"])
+    memb, conf, counter = {}, {}, set()
+    for g in theme_groups(an["analysis_id"]):
+        for rid in g["record_ids"]:
+            memb.setdefault(rid, g["gid"])
+        conf.update(g.get("confidence", {}))
+        counter.update(g["counter_ids"])
+    pts["group_id"] = pts["record_id"].map(memb)
+    pts["confidence"] = pts["record_id"].map(conf).fillna(1.0)
+    pts["is_counter"] = pts["record_id"].isin(counter)
+    pts["is_ambiguous"] = pts["confidence"] < AMBIGUITY_THRESHOLD
+    return pts
+
+
+def _semantic_scatter(pts, groups, focus_gid=None, show_counter=False,
+                      height=560, show_labels=True, chart_key=None,
+                      selectable=True):
+    """The semantic Theme Map figure. Point color = participant reaction
+    (authoritative — never AI sentiment). Group color marks boundaries and
+    labels only. Returns selected record_ids (empty when selection is
+    unsupported or nothing is selected)."""
+    focus_ids = set()
+    if focus_gid:
+        g = next((g for g in groups if g["gid"] == focus_gid), None)
+        if g:
+            focus_ids = set(g["record_ids"])
+    fig = go.Figure()
+    for reaction in ("approve", "disapprove", "none"):
+        sub = pts[pts["reaction"] == reaction]
+        if sub.empty:
+            continue
+        opacity = np.where(sub["is_ambiguous"], 0.3, 0.9)
+        if focus_ids:
+            opacity = np.where(sub["record_id"].isin(list(focus_ids)),
+                               opacity, 0.08)
+        fig.add_scatter(
+            x=sub["semantic_x"], y=sub["semantic_y"],
+            mode="markers", name=reaction.title(),
+            customdata=sub["record_id"],
+            marker=dict(color=REACTION_COLOR[reaction], size=9,
+                        opacity=opacity.tolist(),
+                        line=dict(color="#FFFFFF", width=0.5)),
+            hovertemplate=("%{customdata}<br>"
+                           + reaction.title()
+                           + "<br>“%{text}”<extra></extra>"),
+            text=sub["comment"].str.slice(0, 90))
+    if show_counter:
+        ctr = pts[pts["is_counter"]]
+        if focus_ids:
+            ctr = ctr[ctr["record_id"].isin(list(focus_ids))]
+        if len(ctr):
+            fig.add_scatter(
+                x=ctr["semantic_x"], y=ctr["semantic_y"], mode="markers",
+                name="Counter-evidence",
+                customdata=ctr["record_id"],
+                marker=dict(size=15, color="rgba(0,0,0,0)",
+                            line=dict(color=C["red"], width=2)),
+                hovertemplate="Counter-evidence: %{customdata}<extra></extra>")
+    if show_labels:
+        for g in groups:
+            gp = pts[pts["record_id"].isin(g["record_ids"])]
+            if len(gp) < 2:
+                continue
+            fig.add_annotation(
+                x=float(gp["semantic_x"].median()),
+                y=float(gp["semantic_y"].median()),
+                text=g["name"][:34], showarrow=False,
+                font=dict(size=11, color=GROUP_STATUS_COLOR[g["status"]]),
+                bgcolor="rgba(255,255,255,0.75)",
+                bordercolor=GROUP_STATUS_COLOR[g["status"]], borderwidth=1,
+                opacity=1.0 if (not focus_gid or g["gid"] == focus_gid)
+                else 0.25)
+    if focus_gid and focus_ids:
+        g = next((g for g in groups if g["gid"] == focus_gid), None)
+        gp = pts[pts["record_id"].isin(list(focus_ids))]
+        if g and len(gp) >= 3:
+            try:
+                from scipy.spatial import ConvexHull
+                xy = gp[["semantic_x", "semantic_y"]].to_numpy()
+                hull = ConvexHull(xy)
+                hx = np.append(xy[hull.vertices, 0], xy[hull.vertices[0], 0])
+                hy = np.append(xy[hull.vertices, 1], xy[hull.vertices[0], 1])
+                fig.add_scatter(x=hx, y=hy, mode="lines", showlegend=False,
+                                hoverinfo="skip",
+                                line=dict(color=GROUP_STATUS_COLOR[g["status"]],
+                                          width=2, dash="dot"))
+            except Exception:
+                pass
+    fig.update_layout(
+        height=height, margin=dict(l=10, r=10, t=30, b=10),
+        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        font=dict(color=C["text"], size=12),
+        legend=dict(orientation="h", y=1.08, title="Participant Reaction"),
+        xaxis=dict(title="Semantic Dimension 1", showgrid=True,
+                   gridcolor=C["border"], zeroline=False, showticklabels=False),
+        yaxis=dict(title="Semantic Dimension 2", showgrid=True,
+                   gridcolor=C["border"], zeroline=False, showticklabels=False),
+        dragmode="lasso" if selectable else "pan")
+    selected = []
+    if selectable and chart_key:
+        try:
+            event = st.plotly_chart(
+                fig, width="stretch", key=chart_key, on_select="rerun",
+                selection_mode=("points", "box", "lasso"))
+        except TypeError:
+            # older Streamlit without selection events — chart still renders
+            st.plotly_chart(fig, width="stretch", key=f"{chart_key}-static")
+            event = None
+        try:
+            points = event.selection.get("points", []) if event else []
+            for p in points:
+                rid = p.get("customdata")
+                if rid:
+                    selected.append(str(rid))
+        except Exception:
+            pass
+    else:
+        st.plotly_chart(fig, width="stretch", key=chart_key)
+    return sorted(set(selected))
+
+
+def _reaction_spectrum(pts, groups, dim_label):
+    """Secondary view: participant reaction (authoritative, never AI
+    sentiment) on the horizontal axis, one row per theme — reveals which
+    themes lean approve, disapprove, or split internally."""
+    pos = {"disapprove": -1.0, "none": 0.0, "approve": 1.0}
+    rows = [(g["gid"], g["name"], g["status"], set(g["record_ids"]))
+            for g in groups]
+    assigned = set().union(*[r[3] for r in rows]) if rows else set()
+    un = set(pts["record_id"]) - assigned
+    if un:
+        rows.append(("__none__", "Not in any theme", "human", un))
+    rng = np.random.RandomState(42)
+    fig = go.Figure()
+    ticks, tickvals = [], []
+    plotted = set()
+    for i, (gid, name, status, ids) in enumerate(rows):
+        gp = pts[pts["record_id"].isin(list(ids - plotted))
+                 if gid == "__none__" else pts["record_id"].isin(list(ids))]
+        if gp.empty:
+            continue
+        jitter_x = rng.uniform(-0.32, 0.32, len(gp))
+        jitter_y = rng.uniform(-0.28, 0.28, len(gp))
+        fig.add_scatter(
+            x=gp["reaction"].map(pos).to_numpy() + jitter_x,
+            y=np.full(len(gp), i) + jitter_y,
+            mode="markers", showlegend=False,
+            customdata=gp["record_id"],
+            marker=dict(color=gp["reaction"].map(REACTION_COLOR), size=8,
+                        opacity=0.85, line=dict(color="#FFFFFF", width=0.5)),
+            hovertemplate=("%{customdata} · " + name[:30]
+                           + "<br>“%{text}”<extra></extra>"),
+            text=gp["comment"].str.slice(0, 90))
+        ticks.append(f"{name[:34]}")
+        tickvals.append(i)
+        if gid != "__none__":
+            plotted |= ids
+    fig.update_layout(
+        height=max(320, 90 * max(1, len(tickvals))),
+        margin=dict(l=10, r=10, t=30, b=10),
+        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        font=dict(color=C["text"], size=12),
+        xaxis=dict(tickmode="array", tickvals=[-1, 0, 1],
+                   ticktext=["Disapprove", "None", "Approve"],
+                   range=[-1.6, 1.6], gridcolor=C["border"], zeroline=False,
+                   title="Participant Reaction (participant-provided — "
+                         "not AI sentiment)"),
+        yaxis=dict(tickmode="array", tickvals=tickvals, ticktext=ticks,
+                   gridcolor=C["border"], zeroline=False, autorange="reversed"))
+    st.plotly_chart(fig, width="stretch", key="tmap-spectrum")
+
+
+def theme_mini_map(an, record_ids, counter_ids, key):
+    """Compact visual cluster review used inside theme validation: the
+    theme's comments highlighted in semantic space, counter-evidence ringed,
+    everything else faded."""
+    adf = analysis_df(an)
+    if adf is None or adf.empty:
+        return False
+    coords = get_semantic_coords(an, adf)
+    if not coords:
+        return False
+    pts = _build_theme_map_points(an, adf, coords)
+    focus = set(record_ids)
+    fig = go.Figure()
+    other = pts[~pts["record_id"].isin(list(focus))]
+    if len(other):
+        fig.add_scatter(x=other["semantic_x"], y=other["semantic_y"],
+                        mode="markers", showlegend=False, hoverinfo="skip",
+                        marker=dict(color="#D6D6D2", size=6, opacity=0.4))
+    mine = pts[pts["record_id"].isin(list(focus))]
+    for reaction in ("approve", "disapprove", "none"):
+        sub = mine[mine["reaction"] == reaction]
+        if sub.empty:
+            continue
+        fig.add_scatter(
+            x=sub["semantic_x"], y=sub["semantic_y"], mode="markers",
+            name=reaction.title(), customdata=sub["record_id"],
+            marker=dict(color=REACTION_COLOR[reaction], size=9,
+                        opacity=np.where(sub["is_ambiguous"], 0.35,
+                                         0.95).tolist()),
+            hovertemplate="%{customdata}<br>“%{text}”<extra></extra>",
+            text=sub["comment"].str.slice(0, 90))
+    ctr = mine[mine["record_id"].isin(list(counter_ids))]
+    if len(ctr):
+        fig.add_scatter(x=ctr["semantic_x"], y=ctr["semantic_y"],
+                        mode="markers", name="Counter-evidence",
+                        marker=dict(size=15, color="rgba(0,0,0,0)",
+                                    line=dict(color=C["red"], width=2)),
+                        hoverinfo="skip")
+    fig.update_layout(
+        height=340, margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor="#FFFFFF", paper_bgcolor="#FFFFFF",
+        font=dict(color=C["text"], size=11),
+        legend=dict(orientation="h", y=1.1),
+        xaxis=dict(title="Semantic Dimension 1", showticklabels=False,
+                   gridcolor=C["border"], zeroline=False),
+        yaxis=dict(title="Semantic Dimension 2", showticklabels=False,
+                   gridcolor=C["border"], zeroline=False))
+    st.plotly_chart(fig, width="stretch", key=key)
+    return True
+
+
+def render_theme_map_point_detail(rid, an):
+    """Full source-linked detail for one clicked point."""
+    row = get_record(rid)
+    if row is None:
+        return
+    st.markdown("**Selected comment** — every point remains linked to its "
+                "source record.")
+    comment_card(row, "tmap")
+    memberships = [g for g in theme_groups(an["analysis_id"])
+                   if rid in g["record_ids"]]
+    st.markdown(
+        f'<div class="ces-meta"><b>Current theme:</b> '
+        f'{", ".join(g["name"] for g in memberships) or "— (unassigned)"} · '
+        f'<b>Dataset:</b> {row["dataset_id"]} · '
+        f'<b>Activity:</b> {activity_name(row["activity_id"])}</div>',
+        unsafe_allow_html=True)
+    b1, b2, b3 = st.columns(3)
+    groups = theme_groups(an["analysis_id"])
+    with b1:
+        with st.popover("Add to Theme"):
+            opts = [g["gid"] for g in groups if rid not in g["record_ids"]]
+            if opts:
+                tgt = st.selectbox(
+                    "Theme", opts,
+                    format_func=lambda gid: next(
+                        g["name"] for g in groups if g["gid"] == gid),
+                    key=f"tm-add1-{rid}")
+                if st.button("Add", key=f"tm-add1b-{rid}"):
+                    add_records_to_group(
+                        next(g for g in groups if g["gid"] == tgt), [rid])
+                    st.rerun()
+            else:
+                st.caption("Already in every theme.")
+    with b2:
+        with st.popover("Remove from Theme"):
+            if memberships:
+                tgt = st.selectbox(
+                    "Theme", [g["gid"] for g in memberships],
+                    format_func=lambda gid: next(
+                        g["name"] for g in memberships if g["gid"] == gid),
+                    key=f"tm-rm1-{rid}")
+                if st.button("Remove", key=f"tm-rm1b-{rid}"):
+                    remove_records_from_group(
+                        next(g for g in memberships if g["gid"] == tgt), [rid])
+                    st.rerun()
+            else:
+                st.caption("Not in any theme.")
+    with b3:
+        with st.popover("View Traceability"):
+            chain = ("PROJECT\n  ↓\nENGAGEMENT ACTIVITY\n  ↓\nDATASET\n  ↓\n"
+                     "RAW RECORD\n  ↓\nANALYSIS\n  ↓\nTHEME MAP POINT")
+            st.markdown(f'<div class="ces-chain">{chain}</div>',
+                        unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="ces-meta"><b>Record:</b> {rid} · '
+                f'<b>Response:</b> {row["response_id"]}<br>'
+                f'<b>Source file:</b> {row["source_file"]}<br>'
+                f'<b>Analysis:</b> {an["analysis_name"]} '
+                f'({an["analysis_id"]})</div>', unsafe_allow_html=True)
+
+
+def render_theme_map(an, view, dim_label):
+    """THEME MAP playground module. AI suggests a grouping → human sees it →
+    inspects original comments → modifies the grouping → validates the theme.
+    Spatial proximity = semantic similarity, nothing more."""
+    aid = an["analysis_id"]
+    adf = analysis_df(an)
+    coords = get_semantic_coords(an, adf) if adf is not None else None
+    if not coords:
+        st.caption("Not enough comment text to build a semantic map "
+                   "(needs at least 4 comments with distinct vocabulary).")
+        return
+    groups = theme_groups(aid)
+    if not groups:
+        st.markdown('<div class="ces-note-human">No themes yet — run '
+                    '<b>Run Thematic Analysis</b> in the Themes tab to let AI '
+                    'suggest clusters, then inspect and correct them here. '
+                    'The map still shows every comment.</div>',
+                    unsafe_allow_html=True)
+
+    pts = _build_theme_map_points(an, view, coords)
+    if pts.empty:
+        st.caption("No comments match the current filters.")
+        return
+
+    # ---- controls ----
+    c1, c2, c3, c4 = st.columns([1.5, 1.2, 1.2, 2.1])
+    vmode = c1.radio("View", ["Semantic Map", "Reaction Spectrum"],
+                     horizontal=True, key=f"tm-view-{aid}",
+                     label_visibility="collapsed")
+    show_ambiguous = c2.toggle("Show ambiguous comments", value=True,
+                               key=f"tm-amb-{aid}",
+                               help="Lower-confidence cluster members render "
+                                    "at reduced opacity. They are especially "
+                                    "important for human review and are never "
+                                    "hidden automatically.")
+    show_counter = c3.toggle("Show counter-evidence", value=False,
+                             key=f"tm-ctr-{aid}",
+                             help="Red outer ring: comments semantically "
+                                  "related to a theme but expressing a "
+                                  "competing position. The participant "
+                                  "reaction color is never replaced.")
+    gid_opts = ["None"] + [g["gid"] for g in groups]
+    focus_key = f"tm-focus-{aid}"
+    pending = st.session_state.pop("theme_map_focus", None)
+    if pending in gid_opts:
+        st.session_state[focus_key] = pending
+    if st.session_state.get(focus_key) not in gid_opts:
+        st.session_state[focus_key] = "None"
+    focus_gid = c4.selectbox(
+        "Focus theme", gid_opts, key=focus_key,
+        format_func=lambda gid: "None" if gid == "None" else next(
+            (f'{g["name"]} ({GROUP_STATUS_LABEL[g["status"]]})'
+             for g in groups if g["gid"] == gid), gid))
+    focus_gid = None if focus_gid == "None" else focus_gid
+
+    if not show_ambiguous:
+        pts = pts[~pts["is_ambiguous"]]
+
+    st.markdown(f'<div class="ces-note-ai">{SEMANTIC_AXES_NOTE} '
+                'AI-defined clusters are suggestions for human review — '
+                'never objectively correct groupings.</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "Theme styling: " +
+        pills(*[(GROUP_STATUS_LABEL[s], k) for s, k in
+                [("ai", "ai"), ("human", "human"),
+                 ("validated", "validated")]]) +
+        f'<span class="ces-meta"> · Point color = participant reaction '
+        f'(authoritative, never AI sentiment) · Red ring = counter-evidence '
+        f'· Faded = ambiguous (low cluster confidence)</span>',
+        unsafe_allow_html=True)
+
+    selected = []
+    if vmode == "Semantic Map":
+        selected = _semantic_scatter(
+            pts, groups, focus_gid=focus_gid, show_counter=show_counter,
+            chart_key=f"tm-map-{aid}")
+        st.caption("Lasso or box-select points to correct the grouping; "
+                   "click a single point to inspect its source record.")
+    else:
+        _reaction_spectrum(pts, groups, dim_label)
+        st.caption("Which themes lean approval, which lean disapproval, and "
+                   "which disagree internally — using only the "
+                   "participant-provided reaction.")
+
+    # ---- focused theme panel ----
+    if focus_gid:
+        g = next((g for g in groups if g["gid"] == focus_gid), None)
+        if g:
+            obj = g["obj"]
+            with st.container(border=True):
+                st.markdown(pills((GROUP_STATUS_LABEL[g["status"]],
+                                   g["status"] if g["status"] != "ai"
+                                   else "ai")) + f" **{g['name']}**",
+                            unsafe_allow_html=True)
+                sub = records_for(g["record_ids"])
+                cts = reaction_counts(sub) if len(sub) else \
+                    {"approve": 0, "disapprove": 0, "none": 0}
+                st.markdown(
+                    f'<div class="ces-meta">{len(g["record_ids"])} comments · '
+                    f'Approve {cts["approve"]} · Disapprove '
+                    f'{cts["disapprove"]} · None {cts["none"]} · '
+                    f'{dim_label}s: '
+                    f'{", ".join(sorted(sub["dim_value"].unique())) if len(sub) else "—"}'
+                    '</div>', unsafe_allow_html=True)
+                if g["kind"] == "cluster":
+                    st.markdown(f'<div class="ces-note-ai"><b>AI Summary:</b> '
+                                f'{obj["ai"]["summary"]}</div>',
+                                unsafe_allow_html=True)
+                else:
+                    if obj.get("ai_original_summary"):
+                        st.markdown(f'<div class="ces-note-ai"><b>Original AI '
+                                    f'summary:</b> {obj["ai_original_summary"]}'
+                                    '</div>', unsafe_allow_html=True)
+                    if obj.get("interpretation"):
+                        st.markdown(f'<div class="ces-note-human"><b>Human '
+                                    f'interpretation:</b> '
+                                    f'{obj["interpretation"]}</div>',
+                                    unsafe_allow_html=True)
+                a1, a2, a3, a4 = st.columns(4)
+                with a1:
+                    with st.popover("View Comments"):
+                        for _, r in sub.head(30).iterrows():
+                            comment_card(r, f"tmf-{g['gid']}",
+                                         show_actions=False)
+                        if len(sub) > 30:
+                            st.caption(f"Showing 30 of {len(sub)}.")
+                with a2:
+                    with st.popover("Edit Theme"):
+                        new_name = st.text_input("Working name", g["name"],
+                                                 key=f"tm-edit-{g['gid']}")
+                        if st.button("Apply", key=f"tm-editb-{g['gid']}"):
+                            if g["kind"] == "cluster":
+                                obj["ai"].setdefault("original_name",
+                                                     obj["ai"]["name"])
+                                obj["ai"]["name"] = new_name
+                            else:
+                                obj["name"] = new_name
+                            st.rerun()
+                if g["kind"] == "cluster":
+                    if a3.button("Validate", key=f"tm-val-{g['gid']}",
+                                 type="primary"):
+                        st.session_state.validating_cluster = g["gid"]
+                        st.toast("Open the Themes tab to complete validation "
+                                 "— the visual cluster review is included "
+                                 "there.")
+                        st.rerun()
+                    if a4.button("Reject", key=f"tm-rej-{g['gid']}"):
+                        obj["status"] = "rejected"
+                        # focus_key widget already instantiated this run —
+                        # clear via the pending-focus flag instead
+                        st.session_state.theme_map_focus = "None"
+                        st.rerun()
+
+    # ---- human cluster correction ----
+    st.markdown("---")
+    st.markdown("**Human cluster correction** — AI clustering is a "
+                "suggestion, not a final classification.")
+    label_map = {rid: f'{rid} · {c[:70]}'
+                 for rid, c in zip(pts["record_id"], pts["comment"])}
+    # sync a NEW map selection into the multiselect before it instantiates
+    # (keyed widgets ignore changed defaults); manual edits are kept otherwise
+    sel_key, last_key = f"tm-sel-{aid}", f"tm-lastsel-{aid}"
+    if selected and selected != st.session_state.get(last_key):
+        st.session_state[sel_key] = [r for r in selected if r in label_map]
+        st.session_state[last_key] = selected
+    st.session_state[sel_key] = [r for r in
+                                 st.session_state.get(sel_key, [])
+                                 if r in label_map]
+    manual = st.multiselect(
+        "Selected comments (from map selection, or pick manually)",
+        pts["record_id"].tolist(),
+        format_func=lambda r: label_map.get(r, r), key=sel_key)
+    if len(manual) == 1:
+        render_theme_map_point_detail(manual[0], an)
+    elif len(manual) > 1:
+        st.caption(f"{len(manual)} comments selected.")
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            with st.popover("ADD SELECTED TO THEME"):
+                if groups:
+                    tgt = st.selectbox(
+                        "Theme", [g["gid"] for g in groups],
+                        format_func=lambda gid: next(
+                            g["name"] for g in groups if g["gid"] == gid),
+                        key=f"tm-addsel-{aid}")
+                    if st.button("Add selected", key=f"tm-addselb-{aid}"):
+                        add_records_to_group(
+                            next(g for g in groups if g["gid"] == tgt),
+                            manual)
+                        st.toast(f"{len(manual)} comments added — counts "
+                                 "recalculated from record IDs")
+                        st.rerun()
+                else:
+                    st.caption("No themes exist yet.")
+        with cc2:
+            with st.popover("REMOVE SELECTED FROM THEME"):
+                holding = [g for g in groups
+                           if set(manual) & set(g["record_ids"])]
+                if holding:
+                    tgt = st.selectbox(
+                        "Theme", [g["gid"] for g in holding],
+                        format_func=lambda gid: next(
+                            g["name"] for g in holding if g["gid"] == gid),
+                        key=f"tm-rmsel-{aid}")
+                    if st.button("Remove selected", key=f"tm-rmselb-{aid}"):
+                        remove_records_from_group(
+                            next(g for g in holding if g["gid"] == tgt),
+                            manual)
+                        st.toast("Removed — counts recalculated from "
+                                 "record IDs")
+                        st.rerun()
+                else:
+                    st.caption("Selection is not in any theme.")
+        with cc3:
+            with st.popover("CREATE NEW THEME FROM SELECTED"):
+                tn = st.text_input("Theme name (short)", key=f"tm-nt-{aid}")
+                ti = st.text_area("Interpretation", key=f"tm-nti-{aid}")
+                if st.button("Create theme", key=f"tm-ntb-{aid}"):
+                    if not tn.strip():
+                        st.error("A theme needs a name.")
+                    else:
+                        sub = records_for(manual)
+                        prov = provenance_from_records(manual)
+                        theme_id = next_id("theme_seq", "TH-")
+                        st.session_state.themes.append({
+                            "theme_id": theme_id, "origin": "human",
+                            "analysis_id": aid,
+                            "dimension": an["comparison_dimension"]["name"],
+                            "ai_original_name": None,
+                            "ai_original_summary": None, "ai_source": None,
+                            "name": tn.strip(),
+                            "interpretation": ti.strip(),
+                            "record_ids": sorted(manual),
+                            "excluded_record_ids": [],
+                            "counts": reaction_counts(sub),
+                            "n_respondents":
+                                int(sub["response_id"].nunique()),
+                            "tags": [], "notes": "Created from Theme Map "
+                                                 "selection",
+                            "counter_ids": [], "constraints": [],
+                            "validated":
+                                datetime.date.today().isoformat(),
+                            "status": "HUMAN VALIDATED",
+                            "cluster_key": None, **prov})
+                        st.toast(f"Human theme {theme_id} created from "
+                                 f"{len(manual)} selected comments")
+                        st.rerun()
 
 
 def page_insights():
@@ -2521,6 +3204,15 @@ def page_insights():
             else:
                 st.caption("No numeric ranking fields in the current view.")
 
+    # ---------------- THEME MAP (semantic inspection & correction) ----------
+    if "theme_map" in module_tabs:
+        with module_tabs["theme_map"]:
+            st.subheader("Theme Map")
+            st.caption("Every point is ONE original comment. Spatial "
+                       "proximity indicates semantic similarity — not "
+                       "geographic proximity or causal relationships.")
+            render_theme_map(an, view, dim_label)
+
     if "stakeholders" in module_tabs:
         with module_tabs["stakeholders"]:
             st.subheader("Stakeholder / Demographic Comparison")
@@ -2674,12 +3366,23 @@ def render_theme_expanded(theme):
                             f' {con["id"]} — {con["name"]}',
                             unsafe_allow_html=True)
 
-    if st.button("Add Entire Theme to Decision",
-                 key=f"themedec-{theme['theme_id']}", type="primary"):
+    tb1, tb2 = st.columns(2)
+    if tb1.button("Add Entire Theme to Decision",
+                  key=f"themedec-{theme['theme_id']}", type="primary"):
         if theme["theme_id"] not in st.session_state.decision_staged_themes:
             st.session_state.decision_staged_themes.append(theme["theme_id"])
         st.toast(f'Theme “{theme["name"]}” staged for the next decision — '
                  'underlying evidence stays linked')
+    if theme.get("analysis_id") and get_analysis(theme["analysis_id"]):
+        if tb2.button("View Theme Map", key=f"themetmap-{theme['theme_id']}"):
+            an = get_analysis(theme["analysis_id"])
+            if "theme_map" not in an["enabled_modules"]:
+                an["enabled_modules"].append("theme_map")
+            st.session_state.active_analysis_id = theme["analysis_id"]
+            st.session_state.theme_map_focus = theme["theme_id"]
+            # applied before the nav widget instantiates on the next run
+            st.session_state.nav_target = "03 Insights Playground"
+            st.rerun()
 
     st.markdown("---")
     st.markdown("**Evidence Within This Theme**")
@@ -3106,6 +3809,8 @@ def page_decisions():
 
 def main():
     init_state()
+    if "nav_target" in st.session_state:
+        st.session_state.nav = st.session_state.pop("nav_target")
     proj = st.session_state.project
     with st.sidebar:
         st.markdown("## Civic Evidence Studio")
@@ -3114,7 +3819,7 @@ def main():
         page = st.radio("Navigate", ["01 Data + Context", "02 Analysis Setup",
                                      "03 Insights Playground", "04 Libraries",
                                      "05 Decision Trails"],
-                        label_visibility="collapsed")
+                        key="nav", label_visibility="collapsed")
         st.divider()
         n_act = len(all_activities())
         n_ds = sum(len(a["datasets"]) for a in all_activities())
